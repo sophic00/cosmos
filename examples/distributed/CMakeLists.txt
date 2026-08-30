@@ -9,6 +9,11 @@ target_compile_definitions(replicated_kv_sim PRIVATE COSMOS_SIM)
 target_link_libraries(replicated_kv_sim PRIVATE cosmos)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped malloc/free must be opaque calls to the optimizer; see tests/CMakeLists.txt
+    target_compile_options(replicated_kv_sim PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
     target_link_options(replicated_kv_sim PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"

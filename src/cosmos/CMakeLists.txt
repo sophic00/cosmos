@@ -20,3 +20,8 @@ target_include_directories(cosmos PUBLIC
 # which would otherwise be an undefined symbol unless --wrap=calloc is also
 # passed. See docs/design.md §2 (build matrix) and docs/architecture.md §3.
 target_compile_options(cosmos PRIVATE -ffunction-sections -fdata-sections)
+
+# GCC/Clang treat malloc/free as builtins with known semantics and delete pairs they can prove
+# are dead, so at -O1 and above the call never reaches __wrap_malloc and the allocation is
+# silently untracked. INTERFACE so every binary linking cosmos inherits it, not just this library.
+target_compile_options(cosmos INTERFACE -fno-builtin-malloc -fno-builtin-free)
