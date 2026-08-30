@@ -985,7 +985,7 @@ The order below is deliberately MVP-first: prove that one real fault, injected d
 
 F0 and F1 are deliberately small. One fault class implemented properly — with its gate chain, ledger, and isolation tests solid — makes every later class nearly free. Adding classes before that skeleton is right multiplies the rework. Everything from F4 onward (breadth via swarm, minimization, distributed faults) is real value, but none of it is needed to prove the architecture works — F0 through F3 alone already deliver a usable tool.
 
-The executable, checkpointed version of this roadmap — broken into phases and sprints with per-sprint happy/sad-path checkpoints — lives in **`FAULT_INJECTION_IMPLEMENTATION.md`** (repo root, intentionally not committed; see `.gitignore`).
+The executable, checkpointed version of this roadmap — broken into phases and sprints with per-sprint happy/sad-path checkpoints — lives in **`SPRINT_PLAN.md`**, kept outside the repository as an uncommitted working document.
 
 ---
 

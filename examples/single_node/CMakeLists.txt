@@ -9,15 +9,18 @@ target_compile_definitions(kv_store_sim PRIVATE COSMOS_SIM)
 target_link_libraries(kv_store_sim PRIVATE cosmos)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    # Wrapped malloc/free must be opaque calls to the optimizer; see tests/CMakeLists.txt
-    target_compile_options(kv_store_sim PRIVATE
+  target_compile_options(kv_store_sim PRIVATE
         "-fno-builtin-malloc"
         "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
     )
-    target_link_options(kv_store_sim PRIVATE
+  target_link_options(kv_store_sim PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
         "-Wl,--wrap=pthread_create"
         "-Wl,--wrap=pthread_join"
         "-Wl,--wrap=pthread_mutex_lock"

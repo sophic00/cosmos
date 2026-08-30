@@ -1,5 +1,4 @@
 #include "cosmos/cosmos.hpp"
-#include <stdio.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -14,7 +13,6 @@ int __real_gettimeofday(struct timeval* tv, void* tz);
 int __real_nanosleep(const struct timespec* req, struct timespec* rem);
 
 int __wrap_clock_gettime(clockid_t clock_id, struct timespec* tp) {
-    printf("this is dst wrapper\n");
     return __real_clock_gettime(clock_id, tp);
 }
 

@@ -15,11 +15,15 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(test_wrap_malloc PRIVATE
         "-fno-builtin-malloc"
         "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
     )
     target_link_options(test_wrap_malloc PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
     )
 endif()
 
@@ -32,3 +36,25 @@ add_test(NAME test_random COMMAND test_random)
 add_executable(test_seed_derivation test_seed_derivation.cpp)
 target_link_libraries(test_seed_derivation PRIVATE cosmos)
 add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
+
+add_executable(test_time test_time.cpp)
+target_link_libraries(test_time PRIVATE cosmos)
+add_test(NAME test_time COMMAND test_time)
+
+add_executable(test_simulator test_simulator.cpp)
+target_link_libraries(test_simulator PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Same reason as test_wrap_malloc above: the wrapped symbols must stay opaque calls.
+    target_compile_options(test_simulator PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_simulator PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_simulator COMMAND test_simulator)

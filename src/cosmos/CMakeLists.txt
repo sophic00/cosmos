@@ -23,5 +23,12 @@ target_compile_options(cosmos PRIVATE -ffunction-sections -fdata-sections)
 
 # GCC/Clang treat malloc/free as builtins with known semantics and delete pairs they can prove
 # are dead, so at -O1 and above the call never reaches __wrap_malloc and the allocation is
-# silently untracked. INTERFACE so every binary linking cosmos inherits it, not just this library.
-target_compile_options(cosmos INTERFACE -fno-builtin-malloc -fno-builtin-free)
+# silently untracked. They can also fold malloc+memset(0) into calloc, bypassing the tracked
+# path's OOM decision point. INTERFACE so every binary linking cosmos inherits it, not just
+# this library.
+target_compile_options(cosmos INTERFACE
+    -fno-builtin-malloc
+    -fno-builtin-free
+    -fno-builtin-calloc
+    -fno-builtin-realloc
+)

@@ -1,29 +1,32 @@
 # Justfile for Cosmos
 set shell := ["bash", "-uc"]
 
+# Each devShell sets its own BUILD_DIR so toolchains never share a cmake cache.
+build_dir := env_var_or_default("BUILD_DIR", "build")
+
 default:
     @just --list
 
 # Build production binaries
 build:
-    cmake -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build --parallel --target kv_store_prod replicated_kv_prod
+    cmake -B {{build_dir}} -DCMAKE_BUILD_TYPE=Release
+    cmake --build {{build_dir}} --parallel --target kv_store_prod replicated_kv_prod
 
 # Build simulation binaries only
 sim:
-    cmake -B build -DCOSMOS_BUILD_TESTS=OFF
-    cmake --build build --parallel --target kv_store_sim replicated_kv_sim
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=OFF
+    cmake --build {{build_dir}} --parallel --target kv_store_sim replicated_kv_sim
 
 # Build and run unit tests
 test:
-    cmake -B build -DCOSMOS_BUILD_TESTS=ON
-    cmake --build build --parallel
-    ctest --test-dir build --output-on-failure
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
+    cmake --build {{build_dir}} --parallel
+    ctest --test-dir {{build_dir}} --output-on-failure
 
 # Build all targets (production binaries, simulation examples, and tests)
 all:
-    cmake -B build -DCOSMOS_BUILD_TESTS=ON
-    cmake --build build --parallel
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
+    cmake --build {{build_dir}} --parallel
 
 # Format all C/C++ source and header files
 format:
@@ -36,9 +39,9 @@ format-check:
 # Lint codebase (alias for format-check)
 lint: format-check
 
-# Remove build directory
+# Remove this shell's build directory
 clean:
-    rm -rf build
+    rm -rf {{build_dir}}
 
 alias b := build
 alias s := sim

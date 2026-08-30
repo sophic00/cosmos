@@ -2,5 +2,3 @@ build*/
 .cache/
 compile_commands.json
 .direnv/
-SPRINT_PLAN.md
-FAULT_INJECTION_IMPLEMENTATION.md

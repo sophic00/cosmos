@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cosmos/random.hpp"
+#include <cassert>
 #include <cstdint>
 
 namespace cosmos {
@@ -19,7 +20,9 @@ struct FaultProfile {
     bool should_inject_oom() const {
         if (oom_rate <= 0.0) return false;
         if (oom_rate >= 1.0) return true;
-        // In full engine, draws from seeded RNG stream.
+        // Any rate between the ends needs a draw this overload cannot make, so it would silently
+        // never inject. Use the overload taking a sampled value until the P1 engine lands.
+        assert(false && "should_inject_oom() cannot sample an intermediate oom_rate");
         return false;
     }
 

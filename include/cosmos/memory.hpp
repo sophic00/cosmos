@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <unordered_map>
 
@@ -32,6 +34,13 @@ struct alignas(std::max_align_t) AllocationHeader {
 
 static_assert(sizeof(AllocationHeader) % alignof(std::max_align_t) == 0,
               "AllocationHeader size must be a multiple of max_align_t");
+
+// Every tracked payload is preceded by its header, so a tracked pointer must never be handed to
+// __real_free directly: the real allocation starts sizeof(AllocationHeader) bytes earlier.
+inline AllocationHeader* header_for(void* user_ptr) {
+    return reinterpret_cast<AllocationHeader*>(static_cast<char*>(user_ptr) -
+                                               sizeof(AllocationHeader));
+}
 
 /**
  * @brief Custom C++ allocator for TrackedHeap internal containers (e.g. std::unordered_map).
@@ -94,8 +103,8 @@ struct HeapStats {
  * headers, active allocation maps, and cumulative heap statistics (`HeapStats`).
  *
  * WHY & WHEN IT IS USED:
- * Used by `__wrap_malloc` and `__wrap_free` whenever an active `Simulator` context
- * (`Simulator::has_current()`) is running:
+ * Used by `__wrap_malloc`, `__wrap_free`, `__wrap_calloc`, and `__wrap_realloc` whenever an
+ * active `Simulator` context (`Simulator::has_current()`) is running:
  * - On `allocate(size)`: Allocates `sizeof(AllocationHeader) + size` via `__real_malloc`,
  * initializes the header with canary magic and metadata, records the allocation in `active_map_`,
  * and returns the 16-byte aligned user pointer.
@@ -137,9 +146,14 @@ class TrackedHeap {
     bool deallocate(void* user_ptr) {
         if (!user_ptr) return false;
 
-        constexpr size_t header_size = sizeof(AllocationHeader);
-        auto* header =
-            reinterpret_cast<AllocationHeader*>(static_cast<char*>(user_ptr) - header_size);
+        // Consult the map before touching bytes before the payload: a pointer allocated
+        // via __real_malloc outside the sim heap has no readable AllocationHeader there.
+        auto it = active_map_.find(user_ptr);
+        if (it == active_map_.end()) {
+            return false;
+        }
+
+        auto* header = header_for(user_ptr);
 
         if (header->magic != COSMOS_CANARY_MAGIC) {
             return false;
@@ -149,11 +163,46 @@ class TrackedHeap {
         if (stats_.active_allocations > 0) {
             stats_.active_allocations--;
         }
-        active_map_.erase(user_ptr);
+        active_map_.erase(it);
 
         void* raw_ptr = header;
         __real_free(raw_ptr);
         return true;
+    }
+
+    // True iff user_ptr is a live allocation served by this heap. Map lookup only, so it is
+    // safe to call on arbitrary pointers (passthrough allocations from __real_malloc).
+    bool owns(void* user_ptr) const { return user_ptr && active_map_.contains(user_ptr); }
+
+    /**
+     * @brief Reallocates a tracked allocation, copying preserved contents.
+     *
+     * Returns nullptr when user_ptr is not owned by this heap (caller must passthrough to
+     * __real_realloc) or when the underlying allocation fails; on failure the original block
+     * stays valid and tracked (standard realloc guarantee). A nullptr user_ptr is equivalent
+     * to allocate(new_size). new_size == 0 is rejected here; the wrapper frees instead.
+     */
+    void* reallocate(void* user_ptr, size_t new_size) {
+        assert(new_size > 0);
+
+        if (!user_ptr) {
+            return allocate(new_size);
+        }
+
+        auto it = active_map_.find(user_ptr);
+        if (it == active_map_.end()) {
+            return nullptr;
+        }
+
+        size_t old_size = it->second.requested_size;
+        void* new_ptr = allocate(new_size);
+        if (!new_ptr) {
+            return nullptr;
+        }
+
+        memcpy(new_ptr, user_ptr, old_size < new_size ? old_size : new_size);
+        deallocate(user_ptr);
+        return new_ptr;
     }
 
     void record_oom() { stats_.oom_fault_count++; }

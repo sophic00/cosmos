@@ -1,5 +1,8 @@
 .PHONY: default build sim test all format format-check lint clean
 
+# Each devShell sets its own BUILD_DIR so toolchains never share a cmake cache.
+BUILD_DIR ?= build
+
 default:
 	@echo "Cosmos build tasks:"
 	@echo "  make build         - Build production binaries (Release)"
@@ -12,21 +15,21 @@ default:
 	@echo "  make clean         - Remove build directory"
 
 build:
-	cmake -B build -DCMAKE_BUILD_TYPE=Release
-	cmake --build build --parallel --target kv_store_prod replicated_kv_prod
+	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(BUILD_DIR) --parallel --target kv_store_prod replicated_kv_prod
 
 sim:
-	cmake -B build -DCOSMOS_BUILD_TESTS=OFF
-	cmake --build build --parallel --target kv_store_sim replicated_kv_sim
+	cmake -B $(BUILD_DIR) -DCOSMOS_BUILD_TESTS=OFF
+	cmake --build $(BUILD_DIR) --parallel --target kv_store_sim replicated_kv_sim
 
 test:
-	cmake -B build -DCOSMOS_BUILD_TESTS=ON
-	cmake --build build --parallel
-	ctest --test-dir build --output-on-failure
+	cmake -B $(BUILD_DIR) -DCOSMOS_BUILD_TESTS=ON
+	cmake --build $(BUILD_DIR) --parallel
+	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
 all:
-	cmake -B build -DCOSMOS_BUILD_TESTS=ON
-	cmake --build build --parallel
+	cmake -B $(BUILD_DIR) -DCOSMOS_BUILD_TESTS=ON
+	cmake --build $(BUILD_DIR) --parallel
 
 format:
 	find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +
@@ -37,4 +40,4 @@ format-check:
 lint: format-check
 
 clean:
-	rm -rf build
+	rm -rf $(BUILD_DIR)
