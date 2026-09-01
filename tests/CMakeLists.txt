@@ -39,6 +39,24 @@ add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
 
 add_executable(test_time test_time.cpp)
 target_link_libraries(test_time PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # The test must exercise the actual --wrap substitutions, not pass-through
+    # declarations: the POSIX time functions are builtins, so keep them opaque
+    # calls (same reasoning as test_wrap_malloc above).
+    target_compile_options(test_time PRIVATE
+        "-fno-builtin-clock_gettime"
+        "-fno-builtin-gettimeofday"
+        "-fno-builtin-nanosleep"
+    )
+    target_link_options(test_time PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+    )
+endif()
+
 add_test(NAME test_time COMMAND test_time)
 
 add_executable(test_simulator test_simulator.cpp)

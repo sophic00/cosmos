@@ -3,6 +3,7 @@
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/time.hpp"
 #include <optional>
 #include <utility>
 
@@ -43,6 +44,9 @@ template <typename Injector> class BasicSimulator {
 
     static void set_current(BasicSimulator* sim) { current_sim_ = sim; }
 
+    VirtualClock& clock() { return clock_; }
+    const VirtualClock& clock() const { return clock_; }
+
     TrackedHeap& heap() { return heap_; }
     const TrackedHeap& heap() const { return heap_; }
 
@@ -71,6 +75,7 @@ template <typename Injector> class BasicSimulator {
 
   private:
     inline static thread_local BasicSimulator* current_sim_{nullptr};
+    VirtualClock clock_{};
     TrackedHeap heap_{};
     FaultProfile faults_{};
     Rng fault_rng_;
