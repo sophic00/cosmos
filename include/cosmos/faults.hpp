@@ -1,7 +1,6 @@
 #pragma once
 
 #include "cosmos/random.hpp"
-#include <cassert>
 #include <cstdint>
 
 namespace cosmos {
@@ -17,19 +16,13 @@ inline uint64_t fault_class_seed(uint64_t fault_stream_seed, FaultClass fault_cl
 struct FaultProfile {
     double oom_rate = 0.0; // Heap allocation failure probability [0.0, 1.0]
 
-    bool should_inject_oom() const {
+    // Decides one allocation attempt. Endpoint rates never draw (docs/fault-injection.md §7
+    // Rule 3): a disabled or always-on fault must not shift the stream, so intermediate rates
+    // are the only case that consumes a decision.
+    bool should_inject_oom(Rng& rng) const {
         if (oom_rate <= 0.0) return false;
         if (oom_rate >= 1.0) return true;
-        // Any rate between the ends needs a draw this overload cannot make, so it would silently
-        // never inject. Use the overload taking a sampled value until the P1 engine lands.
-        assert(false && "should_inject_oom() cannot sample an intermediate oom_rate");
-        return false;
-    }
-
-    bool should_inject_oom(double sampled_val) const {
-        if (oom_rate <= 0.0) return false;
-        if (oom_rate >= 1.0) return true;
-        return sampled_val < oom_rate;
+        return rng.uniform() < oom_rate;
     }
 };
 

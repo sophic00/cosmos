@@ -11,6 +11,47 @@ struct ReentrancyGuard {
     ReentrancyGuard() { in_wrap_memory = true; }
     ~ReentrancyGuard() { in_wrap_memory = false; }
 };
+
+// Frees a block whose owning heap was destroyed while the block was still allocated. Registry
+// membership proves the pointer is a sim payload, so the header read is safe. A corrupted canary
+// leaks the block rather than freeing a bogus header-offset address; the registry entry stays in
+// that case, so any later free of the same pointer takes this same header-verified path instead of
+// a passthrough __real_free of a header-offset address. On a successful release the entry is
+// removed: a stale Orphaned entry would outlive the freed block and misroute a later passthrough
+// allocation that reuses the address.
+void free_orphaned_block(void* ptr) {
+    auto* header = cosmos::header_for(ptr);
+    if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
+        header->magic = cosmos::COSMOS_FREED_MAGIC;
+        __real_free(header);
+        cosmos::detail::AllocRegistry::instance().unregister(ptr);
+    }
+}
+
+// realloc semantics for a block whose owning heap is gone: fresh allocation (through the active
+// sim heap when one exists), copy min(old, new), release the old block. No fault injection: the
+// block never belonged to the currently active universe. A corrupted canary fails the resize and
+// leaves the original untouched.
+void* reallocate_orphaned_block(void* ptr, size_t new_size) {
+    auto* header = cosmos::header_for(ptr);
+    if (header->magic != cosmos::COSMOS_CANARY_MAGIC) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+
+    const size_t old_size = header->requested_size;
+    void* new_ptr = cosmos::Simulator::has_current()
+                        ? cosmos::Simulator::current()->heap().allocate(new_size)
+                        : __real_malloc(new_size);
+    if (!new_ptr) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+
+    memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
+    free_orphaned_block(ptr);
+    return new_ptr;
+}
 } // namespace
 
 extern "C" {
@@ -31,15 +72,15 @@ void* __real_realloc(void* ptr, size_t size);
  * - Used during testing builds (`-DCOSMOS_SIM`) to capture memory allocation calls in application
  * code and linked libraries.
  * - Instantiates `ReentrancyGuard` immediately after checking `in_wrap_memory` to ensure all
- * subsequent operations
- *   (`Simulator::has_current()`, `faults().should_inject_oom()`, `heap().record_oom()`, and
- * `heap().allocate(size)`) are fully protected from recursive re-entrancy loops if any internal
- * operation calls `malloc`.
+ * subsequent operations (`Simulator::has_current()`, `faults().should_inject_oom()`,
+ * `heap().record_oom()`, and `heap().allocate(size)`) are fully protected from recursive
+ * re-entrancy loops if any internal operation calls `malloc`.
  * - When an active `Simulator` context (`Simulator::has_current()`) is running:
- *   1. Checks deterministic OOM fault injection (`sim->faults().should_inject_oom()`). If
- * triggered, sets `errno = ENOMEM` and returns `nullptr`.
+ *   1. Checks deterministic OOM fault injection
+ * (`sim->faults().should_inject_oom(sim->fault_rng())`, drawing from the Memory fault sub-stream).
+ * If triggered, sets `errno = ENOMEM` and returns `nullptr`.
  *   2. Delegates to `sim->heap().allocate(size)` to attach allocation metadata headers and record
- * stats.
+ *      stats.
  * - Outside an active simulation context or during internal re-entrant allocations
  * (`in_wrap_memory == true`), falls back directly to native OS `__real_malloc(size)`.
  */
@@ -55,7 +96,7 @@ void* __wrap_malloc(size_t size) {
     }
 
     auto* sim = cosmos::Simulator::current();
-    if (sim->faults().should_inject_oom()) {
+    if (sim->faults().should_inject_oom(sim->fault_rng())) {
         errno = ENOMEM;
         sim->heap().record_oom();
         return nullptr;
@@ -74,17 +115,18 @@ void* __wrap_malloc(size_t size) {
  * WHY & WHEN IT IS USED:
  * - Used during testing builds (`-DCOSMOS_SIM`) to capture heap deallocation calls.
  * - Immediately returns if `ptr == nullptr`.
- * - Instantiates `ReentrancyGuard` to protect context lookups and `TrackedHeap::deallocate` from
- * recursive re-entrancy loops.
- * - If inside an active `Simulator` context (`Simulator::has_current()`):
- *   Delegates to `sim->heap().deallocate(ptr)`. If `deallocate` recognizes the pointer's header
- * canary magic, it updates active heap statistics, marks the header as freed, and frees the raw
- * header via `__real_free`.
- * - If no current Simulator owns the pointer (the owning Simulator may no longer be current), the
- * canary is checked directly: handing a tracked payload to `__real_free` would free an address one
- * header past the real allocation, so the tracked block is freed via its header instead.
- * - For passthrough allocations (allocated via `__real_malloc` outside a simulation context) or
- * during re-entrancy, falls back directly to native OS `__real_free(ptr)`.
+ * - Instantiates `ReentrancyGuard` to protect registry lookups and `TrackedHeap::deallocate` from
+ *   recursive re-entrancy loops.
+ * - Routing is ownership-based via `detail::AllocRegistry`, independent of which `Simulator` (if
+ *   any) is currently active:
+ *   1. Owned: the pointer belongs to a live `TrackedHeap`, which is handed the deallocation so
+ *      the *owning* heap's stats and registry stay correct (cross-simulator frees update the
+ *      right heap instead of leaking phantom active allocations).
+ *   2. Orphaned: the owning heap was destroyed with the block still allocated. The block is
+ *      released via its header, which the registry proves is a real sim payload.
+ *   3. None: the pointer never came from a sim heap, so no header bytes are read and the
+ *      passthrough pointer goes straight to `__real_free(ptr)`.
+ * - During re-entrancy, falls back directly to native OS `__real_free(ptr)`.
  */
 void __wrap_free(void* ptr) {
     if (!ptr) return;
@@ -96,19 +138,13 @@ void __wrap_free(void* ptr) {
 
     ReentrancyGuard guard;
 
-    if (cosmos::Simulator::has_current()) {
-        auto* sim = cosmos::Simulator::current();
-        if (sim->heap().deallocate(ptr)) {
-            return;
-        }
+    auto ownership = cosmos::detail::AllocRegistry::instance().ownership_of(ptr);
+    if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
+        ownership.owner->deallocate(ptr);
+        return;
     }
-
-    // The owning Simulator may no longer be current, so the canary is checked here too: handing a
-    // tracked payload to __real_free would free an address one header past the real allocation.
-    auto* header = cosmos::header_for(ptr);
-    if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
-        header->magic = cosmos::COSMOS_FREED_MAGIC;
-        __real_free(header);
+    if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
+        free_orphaned_block(ptr);
         return;
     }
 
@@ -155,7 +191,7 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
         return nullptr;
     }
 
-    if (sim->faults().should_inject_oom()) {
+    if (sim->faults().should_inject_oom(sim->fault_rng())) {
         errno = ENOMEM;
         sim->heap().record_oom();
         return nullptr;
@@ -180,18 +216,24 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
  * - Used during testing builds (`-DCOSMOS_SIM`) to keep resize operations inside the tracked sim
  * heap instead of silently escaping to the host allocator.
  * - Instantiates `ReentrancyGuard` (same re-entrancy protection as `__wrap_malloc`).
- * - Inside an active `Simulator` context:
- *   1. `realloc(ptr, 0)` frees `ptr` (tracked or passthrough) and returns `nullptr`,
- *      glibc-compatible.
+ * - Routing is ownership-based via `detail::AllocRegistry`, independent of which `Simulator` (if
+ *   any) is currently active:
+ *   1. `realloc(ptr, 0)` frees `ptr` (owned -> owning heap, orphaned -> header-verified raw free,
+ *      passthrough -> `__real_free`) and returns `nullptr`, glibc-compatible.
  *   2. `realloc(nullptr, size)` behaves exactly like `__wrap_malloc(size)`, including OOM fault
  *      injection.
- *   3. For pointers owned by the sim heap: OOM injection may fail the resize with
- *      `errno = ENOMEM`; the original block then remains valid and tracked (standard realloc
- *      guarantee). Otherwise `heap().reallocate` allocates a fresh tracked block, copies
- *      `min(old, new)` bytes, and frees the old block. OOM injection only applies to allocations
- *      served by the sim heap; passthrough pointers never consume fault-stream decisions.
- *   4. For passthrough pointers (allocated via `__real_malloc` outside the simulation context),
- *      forwards to native OS `__real_realloc`.
+ *   3. For pointers owned by a live sim heap: the resize is routed to the *owning* heap, so a
+ *      reallocation from a foreign simulator context stays tracked and accounted by the right
+ *      heap. OOM injection is decided by the currently active simulator's profile, and only when
+ *      that simulator's heap owns the block, so passthrough and foreign-owned resizes never
+ *      consume fault-stream decisions. On injected or real failure the original block remains
+ *      valid and tracked (standard realloc guarantee); `heap().reallocate` otherwise allocates a
+ *      fresh tracked block, copies `min(old, new)` bytes, and frees the old block.
+ *   4. For orphaned pointers (owning heap destroyed with the block still allocated), the resize
+ *      is emulated: fresh allocation, copy, header-verified release of the old block.
+ *   5. For passthrough pointers (allocated via `__real_malloc` outside the simulation context),
+ *      forwards to native OS `__real_realloc`. The registry miss proves the pointer is not a
+ *      sim payload, so the real allocator never sees a header-offset address.
  */
 void* __wrap_realloc(void* ptr, size_t size) {
     if (in_wrap_memory) {
@@ -200,23 +242,25 @@ void* __wrap_realloc(void* ptr, size_t size) {
 
     ReentrancyGuard guard;
 
-    if (!cosmos::Simulator::has_current()) {
-        return __real_realloc(ptr, size);
-    }
-
-    auto* sim = cosmos::Simulator::current();
+    auto ownership = cosmos::detail::AllocRegistry::instance().ownership_of(ptr);
 
     if (size == 0) {
-        if (ptr) {
-            if (!sim->heap().deallocate(ptr)) {
-                __real_free(ptr);
-            }
+        if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
+            ownership.owner->deallocate(ptr);
+        } else if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
+            free_orphaned_block(ptr);
+        } else if (ptr) {
+            __real_free(ptr);
         }
         return nullptr;
     }
 
     if (!ptr) {
-        if (sim->faults().should_inject_oom()) {
+        if (!cosmos::Simulator::has_current()) {
+            return __real_malloc(size);
+        }
+        auto* sim = cosmos::Simulator::current();
+        if (sim->faults().should_inject_oom(sim->fault_rng())) {
             errno = ENOMEM;
             sim->heap().record_oom();
             return nullptr;
@@ -224,17 +268,24 @@ void* __wrap_realloc(void* ptr, size_t size) {
         return sim->heap().allocate(size);
     }
 
-    if (sim->heap().owns(ptr)) {
-        if (sim->faults().should_inject_oom()) {
-            errno = ENOMEM;
-            sim->heap().record_oom();
-            return nullptr;
+    if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
+        if (cosmos::Simulator::has_current()) {
+            auto* sim = cosmos::Simulator::current();
+            if (sim->heap().owns(ptr) && sim->faults().should_inject_oom(sim->fault_rng())) {
+                errno = ENOMEM;
+                sim->heap().record_oom();
+                return nullptr;
+            }
         }
-        void* new_ptr = sim->heap().reallocate(ptr, size);
+        void* new_ptr = ownership.owner->reallocate(ptr, size);
         if (!new_ptr) {
             errno = ENOMEM;
         }
         return new_ptr;
+    }
+
+    if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
+        return reallocate_orphaned_block(ptr, size);
     }
 
     // Passthrough allocation (allocated via __real_malloc outside simulation context)

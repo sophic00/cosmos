@@ -103,7 +103,7 @@ extern "C" {
 
 void* __wrap_malloc(size_t size) {
     auto& sim = cosmos::Universe::current();
-    if (sim.faults().should_inject_oom()) {
+    if (sim.faults().should_inject_oom(sim.fault_rng())) {
         errno = ENOMEM;
         return nullptr;
     }

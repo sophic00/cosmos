@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <unordered_map>
 
@@ -80,10 +81,91 @@ template <typename T, typename U>
 bool operator==(const RawRealAllocator<T>&, const RawRealAllocator<U>&) {
     return true;
 }
-template <typename T, typename U>
-bool operator!=(const RawRealAllocator<T>&, const RawRealAllocator<U>&) {
-    return false;
-}
+
+class TrackedHeap;
+
+namespace detail {
+
+// How the registry classifies a pointer handed to a wrapped free/realloc. Owned means the block
+// belongs to a live TrackedHeap and must be routed there regardless of which Simulator is
+// current. Orphaned means the owning heap was destroyed while the block was still allocated: the
+// block itself is still valid memory, but its stats are frozen and only a header-verified raw
+// free can release it. None means the pointer never came from a sim heap, so no header bytes may
+// be read for it.
+enum class OwnerKind : uint8_t { None, Owned, Orphaned };
+
+struct Ownership {
+    OwnerKind kind = OwnerKind::None;
+    TrackedHeap* owner = nullptr;
+};
+
+/**
+ * @brief Process-wide ownership map from sim-heap payload pointers to their tracking heap.
+ *
+ * WHAT IT IS:
+ * A mutex-guarded std::unordered_map keyed by user payload pointer, with TrackedHeap* values (or
+ * nullptr once the owning heap died). Backed by RawRealAllocator, so registry nodes come from
+ * __real_malloc and never re-enter the wrappers.
+ *
+ * WHY & WHEN IT IS USED:
+ * Per-heap maps alone cannot answer "who owns this pointer" on free: the owning Simulator may no
+ * longer be current (or may be destroyed), yet free/realloc can arrive from any context. The
+ * registry is consulted by TrackedHeap and by the memory wrappers so that frees update the right
+ * heap's stats, foreign passthrough pointers are freed without touching any header bytes, and
+ * blocks orphaned by heap destruction are still released safely.
+ */
+class AllocRegistry {
+  public:
+    static AllocRegistry& instance() {
+        static AllocRegistry registry;
+        return registry;
+    }
+
+    AllocRegistry(const AllocRegistry&) = delete;
+    AllocRegistry& operator=(const AllocRegistry&) = delete;
+
+    void register_alloc(void* user_ptr, TrackedHeap* owner) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        map_[user_ptr] = owner;
+    }
+
+    Ownership ownership_of(void* user_ptr) const {
+        if (!user_ptr) return Ownership{};
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = map_.find(user_ptr);
+        if (it == map_.end()) return Ownership{};
+        if (it->second == nullptr) return Ownership{OwnerKind::Orphaned, nullptr};
+        return Ownership{OwnerKind::Owned, it->second};
+    }
+
+    void unregister(void* user_ptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        map_.erase(user_ptr);
+    }
+
+    // Downgrades every live entry of a dying heap to Orphaned instead of erasing it: the payload
+    // is still allocated, so a later free must be able to tell it apart from a passthrough
+    // pointer (erasing would make the next free pass the header-offset address to __real_free,
+    // corrupting the host allocator).
+    void orphan_owned_by(const TrackedHeap* owner) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : map_) {
+            if (entry.second == owner) {
+                entry.second = nullptr;
+            }
+        }
+    }
+
+  private:
+    AllocRegistry() = default;
+
+    using MapType = std::unordered_map<void*, TrackedHeap*, std::hash<void*>, std::equal_to<void*>,
+                                       RawRealAllocator<std::pair<void* const, TrackedHeap*>>>;
+    MapType map_{};
+    mutable std::mutex mutex_{};
+};
+
+} // namespace detail
 
 /**
  * @brief Cumulative memory allocation statistics for a simulation universe.
@@ -100,23 +182,35 @@ struct HeapStats {
  *
  * WHAT IT IS:
  * The deterministic heap tracking manager owned by `Simulator`. It maintains memory allocation
- * headers, active allocation maps, and cumulative heap statistics (`HeapStats`).
+ * headers and cumulative heap statistics (`HeapStats`), and registers every payload pointer in
+ * the process-wide `detail::AllocRegistry` so frees from any context route back to the right
+ * heap.
  *
  * WHY & WHEN IT IS USED:
- * Used by `__wrap_malloc`, `__wrap_free`, `__wrap_calloc`, and `__wrap_realloc` whenever an
- * active `Simulator` context (`Simulator::has_current()`) is running:
+ * Used by `__wrap_malloc`, `__wrap_free`, `__wrap_calloc`, and `__wrap_realloc` (and reachable
+ * directly through `Simulator::heap()`):
  * - On `allocate(size)`: Allocates `sizeof(AllocationHeader) + size` via `__real_malloc`,
- * initializes the header with canary magic and metadata, records the allocation in `active_map_`,
- * and returns the 16-byte aligned user pointer.
- * - On `deallocate(user_ptr)`: Inspects the header, verifies canary magic, marks the header as
- * freed (`COSMOS_FREED_MAGIC`), erases from `active_map_`, updates active allocation counts, and
- * frees the raw header via `__real_free`.
+ * initializes the header with canary magic and metadata, registers the payload pointer in the
+ * `AllocRegistry`, and returns the 16-byte aligned user pointer.
+ * - On `deallocate(user_ptr)`: Verifies via the registry that this heap owns the pointer, checks
+ * the canary magic, marks the header as freed (`COSMOS_FREED_MAGIC`), unregisters the pointer,
+ * updates active allocation counts, and frees the raw header via `__real_free`.
  * - Enables post-simulation memory leak detection (verifying `active_count() == 0`) and canary
  * corruption validation.
  */
 class TrackedHeap {
   public:
     TrackedHeap() = default;
+
+    // The registry keys payload pointers to this exact heap object, so copies would leave two
+    // objects claiming the same blocks.
+    TrackedHeap(const TrackedHeap&) = delete;
+    TrackedHeap& operator=(const TrackedHeap&) = delete;
+
+    // Blocks still tracked at destruction are orphaned rather than freed: the frozen stats stay
+    // inspectable for leak reporting, and a later free of such a pointer is resolved through the
+    // registry's Orphaned path instead of dereferencing this dead heap.
+    ~TrackedHeap() { detail::AllocRegistry::instance().orphan_owned_by(this); }
 
     void* allocate(size_t size) {
         constexpr size_t header_size = sizeof(AllocationHeader);
@@ -139,23 +233,26 @@ class TrackedHeap {
         stats_.total_allocation_count++;
 
         void* user_ptr = static_cast<char*>(raw) + header_size;
-        active_map_[user_ptr] = *header;
+        detail::AllocRegistry::instance().register_alloc(user_ptr, this);
         return user_ptr;
     }
 
     bool deallocate(void* user_ptr) {
         if (!user_ptr) return false;
 
-        // Consult the map before touching bytes before the payload: a pointer allocated
-        // via __real_malloc outside the sim heap has no readable AllocationHeader there.
-        auto it = active_map_.find(user_ptr);
-        if (it == active_map_.end()) {
+        // Consult the registry before touching bytes before the payload: a pointer not owned by
+        // this heap (passthrough, foreign heap, or orphaned) has no valid AllocationHeader
+        // guarantee there.
+        auto ownership = detail::AllocRegistry::instance().ownership_of(user_ptr);
+        if (ownership.kind != detail::OwnerKind::Owned || ownership.owner != this) {
             return false;
         }
 
         auto* header = header_for(user_ptr);
 
         if (header->magic != COSMOS_CANARY_MAGIC) {
+            // Corruption: keep the block registered so the bad memory is not silently freed via
+            // a bogus address.
             return false;
         }
 
@@ -163,16 +260,19 @@ class TrackedHeap {
         if (stats_.active_allocations > 0) {
             stats_.active_allocations--;
         }
-        active_map_.erase(it);
+        detail::AllocRegistry::instance().unregister(user_ptr);
 
         void* raw_ptr = header;
         __real_free(raw_ptr);
         return true;
     }
 
-    // True iff user_ptr is a live allocation served by this heap. Map lookup only, so it is
+    // True iff user_ptr is a live allocation served by this heap. Registry lookup only, so it is
     // safe to call on arbitrary pointers (passthrough allocations from __real_malloc).
-    bool owns(void* user_ptr) const { return user_ptr && active_map_.contains(user_ptr); }
+    bool owns(void* user_ptr) const {
+        auto ownership = detail::AllocRegistry::instance().ownership_of(user_ptr);
+        return ownership.kind == detail::OwnerKind::Owned && ownership.owner == this;
+    }
 
     /**
      * @brief Reallocates a tracked allocation, copying preserved contents.
@@ -189,12 +289,12 @@ class TrackedHeap {
             return allocate(new_size);
         }
 
-        auto it = active_map_.find(user_ptr);
-        if (it == active_map_.end()) {
+        if (!owns(user_ptr)) {
             return nullptr;
         }
 
-        size_t old_size = it->second.requested_size;
+        // Registry ownership is established, so the header read is safe.
+        size_t old_size = header_for(user_ptr)->requested_size;
         void* new_ptr = allocate(new_size);
         if (!new_ptr) {
             return nullptr;
@@ -213,10 +313,6 @@ class TrackedHeap {
   private:
     uint64_t next_alloc_id_{0};
     HeapStats stats_{};
-    using MapType =
-        std::unordered_map<void*, AllocationHeader, std::hash<void*>, std::equal_to<void*>,
-                           RawRealAllocator<std::pair<void* const, AllocationHeader>>>;
-    MapType active_map_{};
 };
 
 } // namespace cosmos

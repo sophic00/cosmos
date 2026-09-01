@@ -2,10 +2,15 @@
 
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
+#include "cosmos/random.hpp"
 #include <optional>
 #include <utility>
 
 namespace cosmos {
+
+// Default fault-stream seed when a Simulator is built without an explicit one, so runs are
+// reproducible out of the box. ASCII "Cosmos1".
+inline constexpr uint64_t kDefaultUniverseSeed = 0x436F736D6F7331ULL;
 
 // Placeholder injector: the slot exists and stays empty until P1 delivers the real engine.
 struct NoInjector {};
@@ -17,7 +22,10 @@ struct NoInjector {};
 // syscall.
 template <typename Injector> class BasicSimulator {
   public:
-    BasicSimulator() = default;
+    // The seed feeds the per-class fault sub-streams; the Memory stream drives OOM injection.
+    explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
+        : fault_rng_(fault_class_seed(seed, FaultClass::Memory)) {}
+
     ~BasicSimulator() {
         if (current_sim_ == this) {
             current_sim_ = nullptr;
@@ -43,6 +51,10 @@ template <typename Injector> class BasicSimulator {
 
     void set_faults(const FaultProfile& f) { faults_ = f; }
 
+    // The Memory fault sub-stream. Fault decisions that sample (see FaultProfile) draw from it;
+    // endpoint probabilities must not.
+    Rng& fault_rng() { return fault_rng_; }
+
     bool has_injector() const { return injector_.has_value(); }
 
     // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
@@ -61,6 +73,7 @@ template <typename Injector> class BasicSimulator {
     inline static thread_local BasicSimulator* current_sim_{nullptr};
     TrackedHeap heap_{};
     FaultProfile faults_{};
+    Rng fault_rng_;
     std::optional<Injector> injector_{};
 };
 
