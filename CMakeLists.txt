@@ -8,6 +8,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(COSMOS_BUILD_TESTS "Build Cosmos unit tests" ON)
 
+# SiteId and FaultKind are append-only, and every switch over them must stay total: a new site
+# that nobody adds to site_slot()/class_of() would silently become "unknown" forever and could
+# never hold a rule. A warning is not enough to catch that.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Werror=switch)
+endif()
+
 add_subdirectory(src/cosmos)
 add_subdirectory(examples)
 

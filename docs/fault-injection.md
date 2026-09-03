@@ -38,7 +38,7 @@ Research background: **`docs/antithesis-study-notes.md`**. Full API reference: *
 |---|---|
 | **Fault** | A bad-but-legal thing the simulator makes happen (memory failure, dropped packet, crashed node). |
 | **Fault Model** | The written promise of which failures the application claims to survive. Faults outside it produce false bug reports. |
-| **Fault Class** | A family of faults owned by one subsystem: `Memory`, `Network`, `Storage`, `Clock`, `Process`. |
+| **Fault Class** | A family of faults owned by one subsystem: `Memory`, `Network`, `Storage`, `Clock`, `Process`, `Random`. |
 | **Point Fault** | An instant, one-off fault (`malloc` fails). Decided by one dice roll at the call. |
 | **Episode Fault** | A fault with a duration that must later heal (a network partition from t=30ms to t=45ms). |
 | **Knob Fault** | Nothing breaks; a normal tuning value is set to an extreme-but-legal value (a 60s timeout becomes 0.1s). |
@@ -301,7 +301,7 @@ Some sites can fail in more than one way. `send()` can drop the packet, delay it
 ```cpp
 struct SiteOutcome {
     FaultKind kind;    // e.g. PacketDrop, PacketDelay, PacketCorrupt
-    double    weight;  // relative weight; normalized to sum to 1 at validate()
+    double    weight;  // relative weight; any positive scale, normalized by normalize()
 };
 using OutcomeTable = std::vector<SiteOutcome>;   // one table per multi-outcome site
 ```
@@ -350,7 +350,9 @@ Never share with `schedule`. Stream domains extend the four fixed in `docs/desig
 
 ### Rule 2 — Every fault class gets its own sub-stream
 
-Derive `fault` into one sub-stream per class: `Memory`, `Network`, `Storage`, `Clock`, `Process`.
+Derive `fault` into one sub-stream per class: `Memory`, `Network`, `Storage`, `Clock`, `Process`, `Random`.
+
+`Random` covers `getrandom`, whose *values* come from the `User` stream (domain 4) so the application sees a reproducible sequence. Whether the call *fails* is a separate decision and belongs to the `Fault` stream like any other site, so the two never share draws.
 
 **Why:** with a single shared stream, enabling network faults adds extra draws, which shifts every later draw, which means memory faults suddenly happen in completely different places. You could never change one setting at a time.
 
@@ -672,7 +674,7 @@ If a configured fault rate is `0.001` and a run reaches only 200 eligible sites,
 ```cpp
 namespace cosmos {
 
-enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, _Count };
+enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, Random, _Count };
 enum class FaultMode  : uint8_t { Safety, Liveness };
 
 /// Stable identity for every injection site (§6.2). APPEND-ONLY: never renumber
@@ -700,13 +702,29 @@ enum class FaultKind : uint8_t {
     ConnRefused, ConnReset, PeerClose, ShortSend,
     PacketDrop, PacketDelay, PacketReorder, PacketCorrupt,
     ClockStep, SleepInterrupted,
+    RandomEagain,
+    _Count,          // sentinel; new kinds append before it
 };
+
+/// Rule 15, enforced at config time: an outcome must be one the site's own API
+/// could really produce, so `send -> ENOMEM` is rejected by validate() rather
+/// than discovered as a false-positive finding later.
+constexpr bool is_legal_outcome(SiteId, FaultKind);
 
 struct SiteOutcome {
     FaultKind kind;
-    double    weight;    // relative weight; > 0; table normalized to sum 1 at validate()
+    double    weight;    // relative weight; > 0; any scale ({5,3,2} == {0.5,0.3,0.2})
 };
-using OutcomeTable = std::vector<SiteOutcome>;   // >= 1 entry when the rule can fire
+// Inline fixed-capacity storage, not a vector: a config copy must not allocate, because the
+// engine is reached from inside __wrap_malloc. Four is the widest menu any site has (send).
+// The widest menu is send(): reset, short send, drop, delay, reorder, corrupt.
+// A static_assert ties this to is_legal_outcome(), so the cap can never silently
+// be smaller than the outcomes a site is allowed to name.
+constexpr size_t kMaxOutcomes = 6;
+struct OutcomeTable {
+    std::array<SiteOutcome, kMaxOutcomes> entries;
+    size_t count;                                // >= 1 when the rule can fire
+};
 
 /// Rules are generic: the injector chooses a FaultKind and the wrapper maps it
 /// to a legal result for its API (ENOMEM, EIO, ECONNRESET, a short write, ...).
@@ -725,8 +743,17 @@ using NodeId            = uint32_t;
 using NodeSet           = std::vector<NodeId>;
 using EpisodeId         = uint64_t;
 using KnobId            = uint64_t;   // named per app tunable; append-only, like SiteId
-using SiteActivationSet = std::unordered_set<SiteId>;
-using SiteCounterMap    = std::unordered_map<SiteId, uint64_t>;
+/// Every site occupies a pinned slot: wrapper sites fill [0, kWrapperSiteCount), event sites
+/// follow. site_slot() is written out rather than derived from the enum value, so retiring a site
+/// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
+/// sampler iterates and draws against.
+constexpr size_t kWrapperSiteCount = 14;
+constexpr size_t kEventSiteCount   = 3;
+constexpr size_t kSiteCount        = kWrapperSiteCount + kEventSiteCount;
+constexpr size_t site_slot(SiteId);              // total; kNoSite for an unknown value
+
+using SiteActivationSet = std::bitset<kSiteCount>;
+using SiteCounterMap    = std::array<uint64_t, kSiteCount>;
 
 /// An episode's identity: what breaks, and on whom (§4.2).
 struct CrashNode { NodeId id; };
@@ -742,10 +769,15 @@ struct ScheduledEpisode {
 };
 
 enum class ConfigError : uint8_t {
-    BadRate, BadWeight, EmptyOutcomes, TriggerLeSkipFirst,
-    TriggerOnEventSite, RuleOnDisabledClass, EpisodeOutsideWindows,
-    QuorumExceedsNodes, BadWindowOrder,
+    BadRate, BadWeight, BadOutcomeKind, IllegalOutcome, EmptyOutcomes,
+    TriggerLeSkipFirst, TriggerOnEventSite, RuleOnEventSite,
+    RuleOnDisabledClass, EpisodeOutsideWindows, BadEpisodeDuration,
+    UnknownNode, BadKnobOrder, QuorumExceedsNodes, LimitsExceedNodes,
+    BadWindowOrder,
 };
+
+/// Which site the config was wrong about, not just what was wrong with it.
+struct ConfigProblem { ConfigError error; std::optional<SiteId> site; };
 
 /// Pure data. Sampled once per universe from the seed. Copyable and printable,
 /// so a failing run can report the exact configuration that produced it.
@@ -759,9 +791,22 @@ struct FaultConfig {
     // means "not activated". Populated only for classes that are enabled.
     SiteActivationSet activated_sites;
 
-    // Generic per-site rules. A simple site has one non-None outcome; a
-    // multi-outcome site has several. Every wrapper uses this same mechanism.
-    std::unordered_map<SiteId, FaultRule> rules;
+    // Generic per-site rules, indexed by site_slot(). A simple site has one
+    // non-None outcome; a multi-outcome site has several. Every wrapper uses
+    // this same mechanism.
+    //
+    // Fixed storage rather than a hash map, for two reasons. Iteration order is
+    // load-bearing: the swarm sampler draws per site, and an unordered
+    // container's order is specified nowhere — it varies across standard library
+    // implementations and versions — so the same seed could produce different
+    // configs on different machines, breaking Rules 4 and 8 and the (build, seed)
+    // repro contract. And the rules array never allocates, so the decision path
+    // and a rules-only config copy cannot re-enter __wrap_malloc (Rule 7);
+    // scheduled_episodes and knobs are vectors and do allocate, so a config
+    // carrying either is not allocation-free to copy. Event-site slots exist so
+    // that a rule wrongly placed on one is representable, and therefore
+    // rejectable by validate().
+    std::array<std::optional<FaultRule>, kSiteCount> rules;
 
     // Fault-model limits: never exceed what the application promises to survive.
     uint32_t max_crashed_nodes  = 0;
@@ -774,7 +819,9 @@ struct FaultConfig {
     // Knob faults (§4.3): extreme-but-legal tuning values, sampled once per
     // universe. The harness delivers them to the app (env/CLI/config) before
     // the app starts; static for the whole run (Rule 14).
-    std::unordered_map<KnobId, int64_t> knobs;
+    // Strictly ascending by id, checked by validate(): sampling draws per knob,
+    // so the order is part of the reproduction contract exactly as `rules` is.
+    std::vector<Knob> knobs;
 
     // Run lifecycle windows.
     Time warmup_until  = Time::zero();
@@ -787,17 +834,34 @@ struct FaultConfig {
     static FaultConfig sample(Rng& swarm_rng);
 
     /// Rejects configs that would silently misbehave:
-    ///   - every rule rate and outcome weight must be finite and in [0, 1];
+    ///   - every rule rate must be finite and in [0, 1];
     ///   - a rule with rate > 0 or a trigger must have >= 1 outcome; every
-    ///     outcome weight must be > 0; the table is normalized to sum to 1;
+    ///     outcome weight must be > 0 and finite (weights are relative, so any
+    ///     positive scale is legal; normalize() rescales them to sum to 1);
+    ///   - every outcome kind must be one its site's API could really produce
+    ///     (Rule 15), and never FaultKind::None;
+    ///   - a scheduled episode must name real nodes and have a nonzero duration;
+    ///   - max_crashed_nodes + min_healthy_quorum must fit within the node count,
+    ///     or the config contradicts itself;
     ///   - fire_on_eligible_call must be > skip_first (else it can never fire);
     ///   - occurrence triggers are rejected on event sites (§10.2);
     ///   - rules and triggers are rejected for sites whose class is disabled;
     ///   - scheduled episodes must lie inside [warmup_until, quiesce_after);
     ///   - min_healthy_quorum must not exceed the node count;
     ///   - warmup_until must be <= quiesce_after.
+    /// Reports the first problem found, in a fixed order: whole-config limits,
+    /// then sites by ascending slot, then episodes, then knobs. Within a site:
+    /// placement, class, rate, outcomes, trigger. So a NaN rate on a disabled
+    /// class reports RuleOnDisabledClass, not BadRate.
     /// Enforced in sample() and again in the FaultInjector constructor.
-    [[nodiscard]] std::expected<void, ConfigError> validate() const;
+    /// node_count is a parameter rather than a field: cluster size is topology,
+    /// not fault configuration. The error carries the offending site.
+    [[nodiscard]] std::expected<void, ConfigProblem> validate(uint32_t node_count) const;
+
+    /// Rescales every outcome table to sum to 1, once, the way
+    /// std::discrete_distribution does at construction. Separate from validate()
+    /// so a checker never rewrites the config it was asked to inspect; the
+    /// injector calls it on its own copy.
 };
 
 /// Stateful engine. Owns the per-class RNG sub-streams, the budgets, the quiet

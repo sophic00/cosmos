@@ -58,6 +58,10 @@ endif()
 
 add_test(NAME test_time COMMAND test_time)
 
+add_executable(test_faults test_faults.cpp)
+target_link_libraries(test_faults PRIVATE cosmos)
+add_test(NAME test_faults COMMAND test_faults)
+
 add_executable(test_simulator test_simulator.cpp)
 target_link_libraries(test_simulator PRIVATE cosmos)
 

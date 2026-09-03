@@ -151,14 +151,14 @@ void test_every_fault_class_derives_a_distinct_substream() {
     for (uint8_t raw = 0; raw < static_cast<uint8_t>(cosmos::FaultClass::_Count); ++raw) {
         seeds.push_back(cosmos::fault_class_seed(fault_seed, static_cast<cosmos::FaultClass>(raw)));
     }
-    assert(seeds.size() == 5);
+    assert(seeds.size() == static_cast<size_t>(cosmos::FaultClass::_Count));
     assert_all_distinct(seeds);
 
     // The last real class sits at _Count - 1; deriving for it must not fall off the end.
     uint64_t last = cosmos::fault_class_seed(
         fault_seed,
         static_cast<cosmos::FaultClass>(static_cast<uint8_t>(cosmos::FaultClass::_Count) - 1));
-    assert(last == cosmos::fault_class_seed(fault_seed, cosmos::FaultClass::Process));
+    assert(last == cosmos::fault_class_seed(fault_seed, cosmos::FaultClass::Random));
 
     assert_uncorrelated(cosmos::fault_class_seed(fault_seed, cosmos::FaultClass::Memory),
                         cosmos::fault_class_seed(fault_seed, cosmos::FaultClass::Network));
