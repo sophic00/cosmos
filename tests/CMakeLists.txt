@@ -62,6 +62,10 @@ add_executable(test_faults test_faults.cpp)
 target_link_libraries(test_faults PRIVATE cosmos)
 add_test(NAME test_faults COMMAND test_faults)
 
+add_executable(test_fault_injector test_fault_injector.cpp)
+target_link_libraries(test_fault_injector PRIVATE cosmos)
+add_test(NAME test_fault_injector COMMAND test_fault_injector)
+
 add_executable(test_simulator test_simulator.cpp)
 target_link_libraries(test_simulator PRIVATE cosmos)
 

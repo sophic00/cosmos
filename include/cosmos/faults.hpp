@@ -16,6 +16,8 @@ namespace cosmos {
 
 enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, Random, _Count };
 
+constexpr size_t kFaultClassCount = static_cast<size_t>(FaultClass::_Count);
+
 // Each class draws from its own sub-stream so changing one class's config cannot shift another's
 // draws (docs/fault-injection.md §7 Rule 2).
 inline uint64_t fault_class_seed(uint64_t fault_stream_seed, FaultClass fault_class) {
@@ -50,6 +52,8 @@ constexpr size_t kWrapperSiteCount = 14;
 constexpr size_t kEventSiteCount = 3;
 constexpr size_t kSiteCount = kWrapperSiteCount + kEventSiteCount;
 constexpr size_t kNoSite = static_cast<size_t>(-1);
+
+using SiteCounterMap = std::array<uint64_t, kSiteCount>;
 
 // Written out rather than derived from the enum value: the values are append-only but not
 // required to stay contiguous, so a retired site must not shift the slots after it.
@@ -299,6 +303,9 @@ enum class ConfigError : uint8_t {
     QuorumExceedsNodes,
     LimitsExceedNodes,
     BadWindowOrder,
+    // Not a defect in the config: this build has no trigger firing yet, and a rule promising a
+    // deterministic fire would silently never get one. P1-S4 wires the trigger and drops this.
+    TriggerNotImplemented,
 };
 
 // Carries the offending site so a rejected config says where, not just what.
@@ -340,7 +347,7 @@ struct Knob {
 struct FaultConfig {
     FaultMode mode = FaultMode::Safety;
 
-    std::bitset<static_cast<size_t>(FaultClass::_Count)> enabled{};
+    std::bitset<kFaultClassCount> enabled{};
     std::bitset<kSiteCount> activated_sites{};
 
     // Indexed by site_slot(). Fixed storage rather than a hash map: iteration order is what the
