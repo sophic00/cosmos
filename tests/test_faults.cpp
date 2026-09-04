@@ -145,6 +145,16 @@ void test_bad_outcome_tables_are_rejected() {
     must(triggered.set_rule(SiteId::malloc, trigger_only));
     assert_rejects(triggered, ConfigError::EmptyOutcomes);
 
+    // Each weight is finite, but the total overflows; normalize() would then leave the table alone
+    // and the first bucket would swallow every draw.
+    FaultConfig overflowing = valid_config();
+    FaultRule huge;
+    huge.rate = 1.0;
+    must(huge.outcomes.add(FaultKind::OutOfMemory, 1e308));
+    must(huge.outcomes.add(FaultKind::OutOfMemory, 1e308));
+    must(overflowing.set_rule(SiteId::malloc, huge));
+    assert_rejects(overflowing, ConfigError::BadWeight);
+
     for (double weight : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
         FaultConfig bad = valid_config();
         FaultRule rule;
@@ -310,9 +320,10 @@ void test_node_limits_must_be_satisfiable() {
     contradictory.min_healthy_quorum = 2;
     assert_rejects(contradictory, ConfigError::LimitsExceedNodes);
 
+    // Names the limits, not the quorum: this config may never have set a quorum at all.
     FaultConfig too_many = valid_config();
     too_many.max_crashed_nodes = 99;
-    assert_rejects(too_many, ConfigError::QuorumExceedsNodes);
+    assert_rejects(too_many, ConfigError::LimitsExceedNodes);
 
     FaultConfig exact = valid_config();
     exact.max_crashed_nodes = 1;

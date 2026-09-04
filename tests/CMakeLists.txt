@@ -62,6 +62,14 @@ add_executable(test_faults test_faults.cpp)
 target_link_libraries(test_faults PRIVATE cosmos)
 add_test(NAME test_faults COMMAND test_faults)
 
+add_executable(test_faultinjection_phase1_gate test_faultinjection_phase1_gate.cpp)
+target_link_libraries(test_faultinjection_phase1_gate PRIVATE cosmos)
+add_test(NAME test_faultinjection_phase1_gate COMMAND test_faultinjection_phase1_gate)
+
+add_executable(test_ledger test_ledger.cpp)
+target_link_libraries(test_ledger PRIVATE cosmos)
+add_test(NAME test_ledger COMMAND test_ledger)
+
 add_executable(test_fault_draw test_fault_draw.cpp)
 target_link_libraries(test_fault_draw PRIVATE cosmos)
 add_test(NAME test_fault_draw COMMAND test_fault_draw)

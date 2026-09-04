@@ -4,7 +4,6 @@
 #include "cosmos/time.hpp"
 #include <array>
 #include <bitset>
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <expected>
@@ -52,6 +51,7 @@ constexpr size_t kSiteCount = kWrapperSiteCount + kEventSiteCount;
 constexpr size_t kNoSite = static_cast<size_t>(-1);
 
 using SiteCounterMap = std::array<uint64_t, kSiteCount>;
+using SiteActivationSet = std::bitset<kSiteCount>;
 
 // Written out, not derived: the values are append-only but not required to stay contiguous.
 constexpr size_t site_slot(SiteId site) {
@@ -214,6 +214,113 @@ constexpr bool is_legal_outcome(SiteId site, FaultKind kind) {
     return false;
 }
 
+// Switch with no default, so -Werror=switch reports an append-only enum that grew without a name.
+constexpr const char* name_of(FaultClass fault_class) {
+    switch (fault_class) {
+    case FaultClass::Memory:
+        return "Memory";
+    case FaultClass::Network:
+        return "Network";
+    case FaultClass::Storage:
+        return "Storage";
+    case FaultClass::Clock:
+        return "Clock";
+    case FaultClass::Process:
+        return "Process";
+    case FaultClass::Random:
+        return "Random";
+    case FaultClass::_Count:
+        break;
+    }
+    return "?";
+}
+
+constexpr const char* name_of(SiteId site) {
+    switch (site) {
+    case SiteId::malloc:
+        return "malloc";
+    case SiteId::calloc:
+        return "calloc";
+    case SiteId::realloc:
+        return "realloc";
+    case SiteId::open:
+        return "open";
+    case SiteId::read:
+        return "read";
+    case SiteId::write:
+        return "write";
+    case SiteId::fsync:
+        return "fsync";
+    case SiteId::connect:
+        return "connect";
+    case SiteId::accept:
+        return "accept";
+    case SiteId::send:
+        return "send";
+    case SiteId::recv:
+        return "recv";
+    case SiteId::clock_gettime:
+        return "clock_gettime";
+    case SiteId::nanosleep:
+        return "nanosleep";
+    case SiteId::getrandom:
+        return "getrandom";
+    case SiteId::crash_node:
+        return "crash_node";
+    case SiteId::partition:
+        return "partition";
+    case SiteId::pause_node:
+        return "pause_node";
+    }
+    return "?";
+}
+
+constexpr const char* name_of(FaultKind kind) {
+    switch (kind) {
+    case FaultKind::None:
+        return "None";
+    case FaultKind::OutOfMemory:
+        return "OutOfMemory";
+    case FaultKind::OpenEio:
+        return "OpenEio";
+    case FaultKind::ReadEio:
+        return "ReadEio";
+    case FaultKind::WriteEio:
+        return "WriteEio";
+    case FaultKind::ShortWrite:
+        return "ShortWrite";
+    case FaultKind::NoSpace:
+        return "NoSpace";
+    case FaultKind::FsyncEio:
+        return "FsyncEio";
+    case FaultKind::ConnRefused:
+        return "ConnRefused";
+    case FaultKind::ConnReset:
+        return "ConnReset";
+    case FaultKind::PeerClose:
+        return "PeerClose";
+    case FaultKind::ShortSend:
+        return "ShortSend";
+    case FaultKind::PacketDrop:
+        return "PacketDrop";
+    case FaultKind::PacketDelay:
+        return "PacketDelay";
+    case FaultKind::PacketReorder:
+        return "PacketReorder";
+    case FaultKind::PacketCorrupt:
+        return "PacketCorrupt";
+    case FaultKind::ClockStep:
+        return "ClockStep";
+    case FaultKind::SleepInterrupted:
+        return "SleepInterrupted";
+    case FaultKind::RandomEagain:
+        return "RandomEagain";
+    case FaultKind::_Count:
+        break;
+    }
+    return "?";
+}
+
 struct SiteOutcome {
     FaultKind kind = FaultKind::None;
     double weight = 0.0;
@@ -333,7 +440,7 @@ struct FaultConfig {
     FaultMode mode = FaultMode::Safety;
 
     std::bitset<kFaultClassCount> enabled{};
-    std::bitset<kSiteCount> activated_sites{};
+    SiteActivationSet activated_sites{};
 
     // Fixed storage, not a hash map: iteration order is what the swarm sampler draws against
     // (Rules 4 and 8).
@@ -393,9 +500,11 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
     if (warmup_until > quiesce_after) {
         return std::unexpected(ConfigProblem{ConfigError::BadWindowOrder, std::nullopt});
     }
-    if (min_healthy_quorum > node_count || max_crashed_nodes > node_count) {
+    if (min_healthy_quorum > node_count) {
         return std::unexpected(ConfigProblem{ConfigError::QuorumExceedsNodes, std::nullopt});
     }
+    // max_crashed_nodes alone exceeding node_count is caught by the sum below, which names the
+    // limits rather than the quorum the config may never have set.
     // Crashing N while demanding M healthy with N + M > node_count contradicts itself (§2). Summed
     // as 64-bit so two large uint32 limits cannot wrap into a value that passes.
     if (static_cast<uint64_t>(max_crashed_nodes) + min_healthy_quorum > node_count) {
@@ -426,6 +535,7 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
         if (can_fire && rule.outcomes.empty()) {
             return std::unexpected(ConfigProblem{ConfigError::EmptyOutcomes, site});
         }
+        double weight_total = 0.0;
         for (const SiteOutcome& outcome : rule.outcomes) {
             if (outcome.kind == FaultKind::None) {
                 return std::unexpected(ConfigProblem{ConfigError::BadOutcomeKind, site});
@@ -435,6 +545,19 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
             }
             if (!is_legal_outcome(site, outcome.kind)) {
                 return std::unexpected(ConfigProblem{ConfigError::IllegalOutcome, site});
+            }
+            weight_total += outcome.weight;
+        }
+        // Individually finite weights can still sum to infinity, and normalize() then leaves the
+        // table untouched, so the first bucket swallows every draw and the rest never fire.
+        if (!std::isfinite(weight_total)) {
+            return std::unexpected(ConfigProblem{ConfigError::BadWeight, site});
+        }
+        // A weight positive as authored can still underflow to zero once divided by the total, and
+        // an outcome with zero normalized weight is one the walk can never land on.
+        for (const SiteOutcome& outcome : rule.outcomes) {
+            if (outcome.weight / weight_total <= 0.0) {
+                return std::unexpected(ConfigProblem{ConfigError::BadWeight, site});
             }
         }
         if (rule.fire_on_eligible_call.has_value() &&

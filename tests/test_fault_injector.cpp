@@ -318,6 +318,56 @@ void test_streams_are_independent_across_classes() {
     std::cout << "[PASS] test_streams_are_independent_across_classes" << std::endl;
 }
 
+// §14's highest-value test, in its own words: change the network config, assert the memory
+// sub-stream yields the same decisions. The existing isolation test only shows that draining one
+// class inside one injector leaves another alone; this shows two differently-configured runs agree.
+void test_memory_decisions_survive_a_network_config_change() {
+    const auto build = [](double send_rate, bool network_on) {
+        FaultConfig cfg;
+        cfg.enable_class(FaultClass::Memory);
+        must(cfg.activate_site(SiteId::malloc));
+        FaultRule oom;
+        oom.rate = 0.5;
+        must(oom.outcomes.add(FaultKind::OutOfMemory, 1.0));
+        must(cfg.set_rule(SiteId::malloc, oom));
+
+        if (network_on) {
+            cfg.enable_class(FaultClass::Network);
+            must(cfg.activate_site(SiteId::send));
+            FaultRule net;
+            net.rate = send_rate;
+            must(net.outcomes.add(FaultKind::PacketDrop, 1.0));
+            must(net.outcomes.add(FaultKind::ConnReset, 3.0));
+            must(cfg.set_rule(SiteId::send, net));
+        }
+        return cfg;
+    };
+
+    VirtualClock quiet_clock;
+    VirtualClock busy_clock;
+    VirtualClock off_clock;
+    Injector quiet_net = make_injector(build(0.05, true), quiet_clock);
+    Injector busy_net = make_injector(build(0.95, true), busy_clock);
+    Injector no_net = make_injector(build(0.0, false), off_clock);
+
+    for (int i = 0; i < 2000; ++i) {
+        const FaultKind expected = quiet_net.decide(FaultClass::Memory, SiteId::malloc);
+        assert(busy_net.decide(FaultClass::Memory, SiteId::malloc) == expected);
+        assert(no_net.decide(FaultClass::Memory, SiteId::malloc) == expected);
+
+        quiet_net.decide(FaultClass::Network, SiteId::send);
+        busy_net.decide(FaultClass::Network, SiteId::send);
+        no_net.decide(FaultClass::Network, SiteId::send);
+    }
+
+    // The network dimension really did move, or the test above would agree for the wrong reason.
+    assert(busy_net.injections(SiteId::send) > quiet_net.injections(SiteId::send));
+    assert(no_net.injections(SiteId::send) == 0);
+    assert(quiet_net.injections(SiteId::malloc) > 0);
+
+    std::cout << "[PASS] test_memory_decisions_survive_a_network_config_change" << std::endl;
+}
+
 void test_quiesce_window_never_draws() {
     VirtualClock clock;
     FaultConfig cfg = probe_config();
@@ -614,6 +664,7 @@ int main() {
     test_activated_site_without_a_rule_stays_eligible();
     test_zero_rate_never_draws();
     test_streams_are_independent_across_classes();
+    test_memory_decisions_survive_a_network_config_change();
     test_quiesce_window_never_draws();
     test_invalid_config_is_rejected();
     test_trigger_fires_on_its_exact_eligible_call();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cosmos/faults.hpp"
+#include "cosmos/ledger.hpp"
 #include "cosmos/random.hpp"
 #include "cosmos/time.hpp"
 #include <array>
@@ -51,7 +52,7 @@ template <ClockLike Clock> class BasicFaultInjector {
 
     // Gate order is the contract: each early return is what keeps a dead fault from shifting an
     // unrelated class's stream (§10, Rule 3). cls is a cross-check only; the site names the class.
-    FaultKind decide(FaultClass cls, SiteId site) {
+    FaultKind decide([[maybe_unused]] FaultClass cls, SiteId site) {
         assert(class_of(site) == cls);
 
         // Event sites have no wrapper call, and this keeps every index below in range.
@@ -82,11 +83,12 @@ template <ClockLike Clock> class BasicFaultInjector {
         // always lands there. Reading it directly is what keeps the fire zero-draw (Rule 11) —
         // passing 0.0 to select_outcome() would return None for the legal rate-0 trigger-only rule.
         if (rule->fire_on_eligible_call == eligible_calls_[slot]) {
-            ++injections_[slot];
-            return rule->outcomes.entries[0].kind;
+            return record_fire(site_class, site, slot, rule->outcomes.entries[0].kind, false);
         }
 
-        return draw(site_class, slot, *rule);
+        const FaultKind kind = draw(site_class, *rule);
+        if (kind == FaultKind::None) return FaultKind::None;
+        return record_fire(site_class, site, slot, kind, true);
     }
 
     // A counter, not a flag: an inner critical section ending must not re-enable the outer one.
@@ -111,6 +113,8 @@ template <ClockLike Clock> class BasicFaultInjector {
         return slot == kNoSite ? 0 : injections_[slot];
     }
 
+    const FaultLedger& ledger() const { return ledger_; }
+
   private:
     BasicFaultInjector(FaultConfig cfg, uint64_t fault_stream_seed, const Clock& clock)
         : cfg_(std::move(cfg)),
@@ -125,11 +129,22 @@ template <ClockLike Clock> class BasicFaultInjector {
     }
 
     // Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
-    FaultKind draw(FaultClass cls, size_t slot, const FaultRule& rule) {
+    FaultKind draw(FaultClass cls, const FaultRule& rule) {
         if (rule.rate <= 0.0) return FaultKind::None;
+        return select_outcome(streams_[static_cast<size_t>(cls)].uniform(), rule);
+    }
 
-        const FaultKind kind = select_outcome(streams_[static_cast<size_t>(cls)].uniform(), rule);
-        if (kind != FaultKind::None) ++injections_[slot];
+    // Both fire paths land here, so the counter and the ledger cannot drift apart.
+    FaultKind record_fire(FaultClass cls, SiteId site, size_t slot, FaultKind kind, bool drew) {
+        ++injections_[slot];
+        ledger_.record(LedgerEntry{.fire_index = fires_,
+                                   .at = clock_.now(),
+                                   .site = site,
+                                   .eligible_index = eligible_calls_[slot],
+                                   .fault_class = cls,
+                                   .outcome = kind,
+                                   .drew = drew});
+        ++fires_;
         return kind;
     }
 
@@ -139,6 +154,8 @@ template <ClockLike Clock> class BasicFaultInjector {
     int quiet_depth_{0};
     SiteCounterMap eligible_calls_{};
     SiteCounterMap injections_{};
+    FaultLedger ledger_{};
+    uint64_t fires_{0};
 };
 
 // Non-movable too: a second owner would pop a quiet window it never pushed.

@@ -514,9 +514,11 @@ The gate chain above always ends the same way: a random draw decides whether a f
 **A deterministic trigger is a fact, not a coin flip.** It replaces the draw with a direct check, so it never touches the RNG at all:
 
 ```text
-quiet? → class on? → site on? → warmup? → skip_first passed?
+quiet? → class on? → site on? → warmup?
                                               │
                      (all gates passed — eligible_calls[site] += 1)
+                                              │
+                                     skip_first passed?
                                               │
                      eligible_calls[site] == fire_on_eligible_call?
                                      │                        │
@@ -556,7 +558,9 @@ cfg.rules.emplace(SiteId::write, std::move(rule));
 
 It does **not** apply to process/topology faults. There is no `crash()` symbol in the application's binary for the linker to wrap, so there is no "eligible call" to count — an occurrence trigger on `site::crash_node` is a category error, and `validate()` rejects it (§12). Episode faults get their own deterministic trigger form in §10.2.
 
-**Ledger entry:** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
+A trigger refused because its budget is spent is **not** a ledger entry. `max_injections` is one of §11.1's routine gate rejections, which are counted and never recorded; the `Skipped` status is for episode starts refused by a §2 fault-model limit or by the quiesce window. The diagram's `Skipped` box therefore means "did not fire, and the per-site counters say so" — not "wrote a skip entry."
+
+**Ledger entry (for a fire):** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
 
 ```text
 t=61ms   Memory   site=malloc   FIRED   drew=no   reason=trigger_matched(eligible_call=443)
@@ -1005,7 +1009,8 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
-| Episodes, ledger, `begin_quiesce()`, mode transitions | Absent | F1 (ledger), F6 (episodes, limits, mode) |
+| Ledger | Records fires only, in fixed non-allocating storage (Rule 7), with the §11.1 printer. No `Status` field yet: `Fired` is the only status P1 can produce, so the printer emits it as a literal in that column | F6 adds `Status` with episodes and heals; F5 adds the decision trace (§11.2) |
+| Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
 
 **Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.
 
@@ -1025,7 +1030,7 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 | 6 | Fault identity comes from the recorded decision trace, not a live counter | Minimization (Phase 5) cannot be built |
 | 7 | Engine-internal allocations are never faulted | The simulator corrupts itself; all results invalid |
 | 8 | **Config sampling** uses a fixed class-indexed draw schedule, including disabled classes | Swarm dimensions become correlated; toggling one class shifts another's rate |
-| 9 | The ledger is recorded for every decision, with status and `drew` flag | Replay cannot distinguish "returned early" from "drew and lost" |
+| 9 | Every recorded decision carries a status and a `drew` flag. The **ledger** records fires, heals and limit-refusals (§11.1); the **decision trace** (§11.2, F5) is the every-decision record | Replay cannot distinguish "returned early" from "drew and lost" |
 | 10 | The trace hash covers a canonical encoding, never in-memory layout | `--verify` fails across compilers and platforms for non-determinism reasons |
 | 11 | A deterministic trigger (§10.1 occurrence, §10.2 virtual-time) firing never consumes a draw | A scripted, exact scenario would perturb unrelated probabilistic faults sharing the same run |
 | 12 | Replay of a fixed decision trace never invents new faults: on trace mismatch or exhaustion, eligible calls pass through with no draw | Minimization re-runs get confounded by faults that never existed in the original run (§11.2) |
