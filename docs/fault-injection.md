@@ -983,6 +983,23 @@ class Scenario {
 
 The scaffolded `FaultProfile` (`oom_rate` + `should_inject_oom(Rng&)` in `include/cosmos/faults.hpp`) is replaced by `FaultConfig` / `FaultRule` / `FaultInjector`. The split exists precisely because `FaultProfile` fused user-facing config with engine state: the scaffold's intermediate-rate decisions currently draw from the Simulator's Memory sub-stream via `should_inject_oom(Rng& rng)` (endpoint rates consume no draw, §7 Rule 3), and sprint F2 moves that decision into `FaultInjector::decide(FaultClass::Memory, SiteId::malloc)` with full rule/timeline support. `wrap_memory.cpp` is re-pointed at that call site in sprint F2, `FaultProfile` is deleted, and the `FaultProfile` mentions in `docs/design.md` §4/§9 are updated to match. What survives from the current header: `FaultClass` and `fault_class_seed` (§7 Rule 2's per-class sub-stream derivation), which the new design keeps unchanged.
 
+### 12.3 What Phase 1 ships, and how it differs from the reference above
+
+The declarations in §12 describe the **F6-complete** injector. Phases 1–5 ship strict subsets, so reading §12 against the code turns up differences that are planned sequencing rather than drift. This table is the reconciliation; a row leaves it when the sprint in its last column lands. A difference still listed here after that sprint is real drift and should be fixed.
+
+| §12 reference | What the code has today | Closed by |
+|---|---|---|
+| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock)` | F6: event queue + node registry |
+| Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
+| `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
+| Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
+| Occurrence triggers (`fire_on_eligible_call`) | Not wired. `create()` rejects any config that sets one, with a temporary `ConfigError::TriggerNotImplemented` | F1: wiring the trigger deletes that enum member |
+| Episodes, ledger, `begin_quiesce()`, mode transitions | Absent | F1 (ledger), F6 (episodes, limits, mode) |
+
+**Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.
+
+**One conformance note on the walk.** `normalize()` divides by the weight total, so the walk's cumulative sum can stop a hair below 1, and a draw landing in that gap returns `None` — a fire is lost. The pseudocode in §6.5 has the same property, so the implementation is conformant rather than buggy. The gap is the per-fire loss probability, and it is asserted to stay within a few ULPs, which bounds the loss at roughly one fire in 10¹⁵ rather than leaving it unquantified.
+
 ---
 
 ## 13. Determinism Rules (Summary)

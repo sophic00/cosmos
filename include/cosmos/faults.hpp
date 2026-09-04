@@ -18,16 +18,14 @@ enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, Rand
 
 constexpr size_t kFaultClassCount = static_cast<size_t>(FaultClass::_Count);
 
-// Each class draws from its own sub-stream so changing one class's config cannot shift another's
-// draws (docs/fault-injection.md §7 Rule 2).
+// Each class draws from its own sub-stream, so one class's config cannot shift another's (Rule 2).
 inline uint64_t fault_class_seed(uint64_t fault_stream_seed, FaultClass fault_class) {
     return derive_seed(fault_stream_seed, static_cast<uint64_t>(fault_class));
 }
 
 enum class FaultMode : uint8_t { Safety, Liveness };
 
-// Append-only: never renumber or reuse a value. Ledgers, decision traces and repro commands all
-// key on these, so a renumber silently re-points every historical repro (Rule 13).
+// Append-only: traces and repro commands key on these, so renumbering re-points history (Rule 13).
 enum class SiteId : uint64_t {
     malloc = 1,
     calloc = 2,
@@ -55,8 +53,7 @@ constexpr size_t kNoSite = static_cast<size_t>(-1);
 
 using SiteCounterMap = std::array<uint64_t, kSiteCount>;
 
-// Written out rather than derived from the enum value: the values are append-only but not
-// required to stay contiguous, so a retired site must not shift the slots after it.
+// Written out, not derived: the values are append-only but not required to stay contiguous.
 constexpr size_t site_slot(SiteId site) {
     switch (site) {
     case SiteId::malloc:
@@ -107,8 +104,7 @@ constexpr std::array<SiteId, kSiteCount> kAllSites{
 
 constexpr SiteId site_at_slot(size_t slot) { return kAllSites[slot]; }
 
-// -Werror=switch catches a new site missing from site_slot(), but not one missing from kAllSites:
-// that drift would silently index past the rules array instead.
+// -Werror=switch catches a site missing from site_slot(); a gap here would index past rules.
 constexpr bool slots_are_consistent() {
     for (size_t slot = 0; slot < kSiteCount; ++slot) {
         if (site_slot(kAllSites[slot]) != slot) return false;
@@ -119,8 +115,7 @@ static_assert(slots_are_consistent(), "kAllSites and site_slot() disagree");
 
 constexpr bool is_known_site(SiteId site) { return site_slot(site) != kNoSite; }
 
-// Event sites have no POSIX call to wrap, so they carry no rate and no occurrence trigger; they
-// fire from FaultConfig::scheduled_episodes or the harness instead (§10.2).
+// Event sites have no call to wrap, so no rate and no trigger; they fire from episodes (§10.2).
 constexpr bool is_event_site(SiteId site) {
     const size_t slot = site_slot(site);
     return slot != kNoSite && slot >= kWrapperSiteCount;
@@ -155,8 +150,7 @@ constexpr FaultClass class_of(SiteId site) {
     return FaultClass::_Count;
 }
 
-// What the wrapper should make the call do. None = pass through unchanged. The wrapper, never the
-// injector, maps a kind to a legal result for its API (§8.2). Append-only, like SiteId.
+// The wrapper, never the injector, maps a kind to a legal result for its API (§8.2). Append-only.
 enum class FaultKind : uint8_t {
     None = 0,
     OutOfMemory,
@@ -180,8 +174,7 @@ enum class FaultKind : uint8_t {
     _Count,
 };
 
-// Rule 15 at config time: an outcome must be one the site's own API could really produce. Without
-// this, a rule can ask send() to return ENOMEM, and the app is tested against an impossible world.
+// Rule 15: without this a rule can ask send() for ENOMEM, testing an impossible world.
 constexpr bool is_legal_outcome(SiteId site, FaultKind kind) {
     switch (site) {
     case SiteId::malloc:
@@ -228,13 +221,10 @@ struct SiteOutcome {
     constexpr bool operator==(const SiteOutcome&) const = default;
 };
 
-// The widest menu is send(): reset, short send, drop, delay, reorder, corrupt. Inline storage
-// keeps a rule copy allocation-free, which matters because the engine is reached from inside
-// __wrap_malloc.
+// Inline storage keeps a rule copy allocation-free; the engine runs inside __wrap_malloc.
 constexpr size_t kMaxOutcomes = 6;
 
-// A table too small to hold everything is_legal_outcome() permits would silently drop the
-// outcomes past the cap, leaving a config the user asked for unbuildable.
+// A cap below what is_legal_outcome() permits would silently drop outcomes the user asked for.
 constexpr size_t widest_legal_menu() {
     size_t worst = 0;
     for (SiteId site : kAllSites) {
@@ -256,8 +246,7 @@ struct OutcomeTable {
     constexpr bool empty() const { return count == 0; }
     constexpr bool full() const { return count == kMaxOutcomes; }
 
-    // False means the table was full and the outcome was dropped; a silently shortened table is a
-    // different configuration than the one asked for.
+    // False means the table was full: a silently shortened table is a different configuration.
     [[nodiscard]] constexpr bool add(FaultKind kind, double weight) {
         if (full()) return false;
         entries[count] = SiteOutcome{kind, weight};
@@ -303,8 +292,7 @@ enum class ConfigError : uint8_t {
     QuorumExceedsNodes,
     LimitsExceedNodes,
     BadWindowOrder,
-    // Not a defect in the config: this build has no trigger firing yet, and a rule promising a
-    // deterministic fire would silently never get one. P1-S4 wires the trigger and drops this.
+    // Not a config defect: this build fires no triggers yet, so the promise would go unmet.
     TriggerNotImplemented,
 };
 
@@ -342,16 +330,14 @@ struct Knob {
     int64_t value = 0;
 };
 
-// Pure data, sampled once per universe. Copyable and printable so a failing run can report the
-// exact configuration that produced it.
+// Pure data, sampled once per universe; copyable so a failing run can report it.
 struct FaultConfig {
     FaultMode mode = FaultMode::Safety;
 
     std::bitset<kFaultClassCount> enabled{};
     std::bitset<kSiteCount> activated_sites{};
 
-    // Indexed by site_slot(). Fixed storage rather than a hash map: iteration order is what the
-    // swarm sampler draws against, and an unordered container's order is not part of any spec
+    // Fixed storage, not a hash map: iteration order is what the swarm sampler draws against
     // (Rules 4 and 8).
     std::array<std::optional<FaultRule>, kSiteCount> rules{};
 
@@ -373,8 +359,7 @@ struct FaultConfig {
         return slot != kNoSite && activated_sites.test(slot);
     }
 
-    // False means the site is not one this build knows; the call stored nothing. Checked rather
-    // than ignored because P5 replay parses site ids out of a recorded trace.
+    // False means the build does not know the site; P5 replay parses ids from a trace.
     [[nodiscard]] bool activate_site(SiteId site) {
         const size_t slot = site_slot(site);
         if (slot == kNoSite) return false;
@@ -395,17 +380,12 @@ struct FaultConfig {
         return true;
     }
 
-    // Checks only; never mutates. Normalization is a separate step so a checker cannot surprise a
-    // caller by rewriting the config it was asked to inspect.
-    //
-    // Reports the first problem it finds, in a fixed order: whole-config limits, then sites by
-    // ascending slot, then episodes, then knobs. Within a site: placement, then class, then rate,
-    // then outcomes, then trigger. So a NaN rate on a disabled class reports RuleOnDisabledClass,
-    // not BadRate — fix what it names, then re-run.
+    // Checks only; normalization is separate so a checker cannot rewrite the config it inspects.
+    // Reports the first problem in a fixed order, so a NaN rate on a disabled class reports
+    // RuleOnDisabledClass rather than BadRate.
     [[nodiscard]] std::expected<void, ConfigProblem> validate(uint32_t node_count) const;
 
-    // Scales every outcome table to sum to 1, once, the way std::discrete_distribution does at
-    // construction. Called by the injector on its own copy, never on the user's config.
+    // Scales tables to sum to 1, like std::discrete_distribution; called on the injector's copy.
     void normalize();
 };
 
@@ -418,9 +398,8 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
     if (min_healthy_quorum > node_count || max_crashed_nodes > node_count) {
         return std::unexpected(ConfigProblem{ConfigError::QuorumExceedsNodes, std::nullopt});
     }
-    // A config that may crash N while demanding M healthy, with N + M > node_count, contradicts
-    // itself: honouring one limit necessarily breaks the other (§2). Summed as 64-bit so two
-    // large uint32 limits cannot wrap into a value that passes.
+    // Crashing N while demanding M healthy with N + M > node_count contradicts itself (§2). Summed
+    // as 64-bit so two large uint32 limits cannot wrap into a value that passes.
     if (static_cast<uint64_t>(max_crashed_nodes) + min_healthy_quorum > node_count) {
         return std::unexpected(ConfigProblem{ConfigError::LimitsExceedNodes, std::nullopt});
     }
@@ -470,8 +449,7 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
         if (episode.at < warmup_until || episode.at >= quiesce_after) {
             return std::unexpected(ConfigProblem{ConfigError::EpisodeOutsideWindows, std::nullopt});
         }
-        // Rule 5: an episode must schedule its own heal, and a zero-length one heals at the
-        // instant it starts, so the application never observes it.
+        // Rule 5: a zero-length episode heals as it starts, so the application never observes it.
         if (episode.until_heal <= Duration::zero()) {
             return std::unexpected(ConfigProblem{ConfigError::BadEpisodeDuration, std::nullopt});
         }
@@ -491,9 +469,7 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
         }
     }
 
-    // Knobs are drawn per id during swarm sampling, so their order is part of the reproduction
-    // contract exactly as the rules array's is. Strictly ascending also rules out a duplicate id
-    // silently shadowing an earlier value.
+    // Knobs are drawn per id, so order is part of the reproduction contract; no duplicates.
     for (size_t i = 1; i < knobs.size(); ++i) {
         if (knobs[i - 1].id >= knobs[i].id) {
             return std::unexpected(ConfigProblem{ConfigError::BadKnobOrder, std::nullopt});
@@ -512,8 +488,7 @@ inline void FaultConfig::normalize() {
         for (size_t i = 0; i < table.count; ++i) {
             total += table.entries[i].weight;
         }
-        // A non-finite total would divide every weight to zero and leave the categorical walk with
-        // nothing to land on; validate() rejects such tables, so leave them untouched here.
+        // validate() rejects non-finite totals, so leave them rather than zeroing every weight.
         if (!std::isfinite(total) || total <= 0.0) continue;
         for (size_t i = 0; i < table.count; ++i) {
             table.entries[i].weight /= total;
@@ -525,9 +500,7 @@ inline void FaultConfig::normalize() {
 struct FaultProfile {
     double oom_rate = 0.0; // Heap allocation failure probability [0.0, 1.0]
 
-    // Decides one allocation attempt. Endpoint rates never draw (docs/fault-injection.md §7
-    // Rule 3): a disabled or always-on fault must not shift the stream, so intermediate rates
-    // are the only case that consumes a decision.
+    // Endpoint rates never draw (Rule 3): only intermediate rates consume a decision.
     bool should_inject_oom(Rng& rng) const {
         if (oom_rate <= 0.0) return false;
         if (oom_rate >= 1.0) return true;

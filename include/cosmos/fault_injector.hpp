@@ -12,19 +12,29 @@
 
 namespace cosmos {
 
-// The injector reads virtual time and never advances it, so a clock only has to answer now().
-// P6 swaps VirtualClock's placeholder implementation for the runtime's real one; because the
-// requirement is this small, neither this parameter nor decide() changes with it.
+// P6 swaps VirtualClock's implementation, not this parameter: the injector only ever reads now().
 template <typename C>
 concept ClockLike = requires(const C& clock) {
     { clock.now() } -> std::same_as<Time>;
 };
 
+// Pure so the edges can be pinned at values no seed reaches; rate 0 returns before dividing.
+constexpr FaultKind select_outcome(double value, const FaultRule& rule) {
+    if (value >= rule.rate) return FaultKind::None;
+
+    const double rescaled = value / rule.rate;
+    double cumulative = 0.0;
+    for (const SiteOutcome& outcome : rule.outcomes) {
+        cumulative += outcome.weight;
+        if (rescaled < cumulative) return outcome.kind;
+    }
+    // Normalized weights can sum to a hair under 1, leaving a draw past the last bucket.
+    return FaultKind::None;
+}
+
 template <ClockLike Clock> class BasicFaultInjector {
   public:
-    // Construction is fallible, so it goes through a factory rather than a constructor that can
-    // only assert: an injector built on an unchecked config invalidates every result of the run
-    // that uses it, and an assert would wave that through under NDEBUG.
+    // A factory, not a constructor: an assert would wave an invalid config through under NDEBUG.
     [[nodiscard]] static std::expected<BasicFaultInjector, ConfigProblem>
     create(FaultConfig cfg, uint64_t fault_stream_seed, uint32_t node_count, const Clock& clock) {
         if (const auto checked = cfg.validate(node_count); !checked.has_value()) {
@@ -39,43 +49,35 @@ template <ClockLike Clock> class BasicFaultInjector {
         return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock);
     }
 
-    // Copying would fork the engine: two injectors on one clock, drawing from independent stream
-    // positions and spending separate budgets against the same run. The move stays because
-    // create() hands the injector back by value; a reference member rules out move-assignment.
+    // A copy would fork the engine: two stream positions and two budgets against one run.
     BasicFaultInjector(const BasicFaultInjector&) = delete;
     BasicFaultInjector& operator=(const BasicFaultInjector&) = delete;
     BasicFaultInjector(BasicFaultInjector&&) = default;
     BasicFaultInjector& operator=(BasicFaultInjector&&) = delete;
 
-    // Gate order is the contract, not a style choice: every gate that returns before the draw is
-    // what keeps a disabled fault from shifting an unrelated class's stream (§10, Rule 3).
-    //
-    // cls is a cross-check, not an input: every decision below reads the class off the site, so
-    // wiring cls back into the logic would reintroduce two sources of truth for one fact.
+    // Gate order is the contract: each early return is what keeps a dead fault from shifting an
+    // unrelated class's stream (§10, Rule 3). cls is a cross-check only; the site names the class.
     FaultKind decide(FaultClass cls, SiteId site) {
         assert(class_of(site) == cls);
 
-        // Unknown ids and event sites have no wrapper call to decide for. Returning here also
-        // keeps every index below in range without leaning on a debug-only assert.
+        // Event sites have no wrapper call, and this keeps every index below in range.
         const size_t slot = site_slot(site);
         if (slot >= kWrapperSiteCount) return FaultKind::None;
 
         if (quiet_depth_ > 0) return FaultKind::None;
         if (clock_.now() >= cfg_.quiesce_after) return FaultKind::None;
 
-        // Taken from the site rather than the caller's argument, so a mismatched class can only
-        // trip the assert above, never gate on one class while drawing from another's stream.
+        // From the site, never the argument: gating on one class and drawing from another's
+        // stream would survive NDEBUG.
         const FaultClass site_class = class_of(site);
         if (!cfg_.is_class_enabled(site_class)) return FaultKind::None;
         if (!cfg_.is_site_activated(site)) return FaultKind::None;
         if (clock_.now() < cfg_.warmup_until) return FaultKind::None;
 
-        // A call is eligible once it clears quiet/class/site/warmup, and skip_first and the
-        // trigger both count from here, so this increment must precede the gates below (§10).
+        // skip_first and the trigger count from here, so this precedes the gates below (§10).
         ++eligible_calls_[slot];
 
-        // An activated site need not carry a rule: the swarm can turn a site on without giving it
-        // anything to do, and a site with no rule can never fire.
+        // The swarm can activate a site without giving it a rule.
         const FaultRule* rule = cfg_.rule_for(site);
         if (rule == nullptr) return FaultKind::None;
 
@@ -85,12 +87,10 @@ template <ClockLike Clock> class BasicFaultInjector {
         return draw(site_class, slot, *rule);
     }
 
-    // A counter rather than a flag: nested critical sections are normal, and the inner section
-    // ending must not re-enable faults for the outer one.
+    // A counter, not a flag: an inner critical section ending must not re-enable the outer one.
     void push_quiet() { ++quiet_depth_; }
 
-    // Clamped as well as asserted: an unbalanced pop that drove the depth negative would re-enable
-    // faults inside a critical section that is still running.
+    // Clamped as well as asserted: underflow re-enables faults inside a live critical section.
     void pop_quiet() {
         assert(quiet_depth_ > 0);
         if (quiet_depth_ > 0) --quiet_depth_;
@@ -122,25 +122,13 @@ template <ClockLike Clock> class BasicFaultInjector {
         return {Rng(fault_class_seed(seed, static_cast<FaultClass>(I)))...};
     }
 
-    // One draw decides both whether the site fires and which outcome it produces (§6.5). A rate of
-    // zero cannot fire, so it returns without drawing; a rate of one still draws, because the
-    // outcome menu is what the draw selects from.
+    // Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
     FaultKind draw(FaultClass cls, size_t slot, const FaultRule& rule) {
         if (rule.rate <= 0.0) return FaultKind::None;
 
-        const double value = streams_[static_cast<size_t>(cls)].uniform();
-        if (value >= rule.rate) return FaultKind::None;
-
-        double cumulative = 0.0;
-        for (const SiteOutcome& outcome : rule.outcomes) {
-            cumulative += outcome.weight;
-            if (value / rule.rate < cumulative) {
-                ++injections_[slot];
-                return outcome.kind;
-            }
-        }
-        // Normalized weights can sum to a hair under 1, leaving a draw past the last bucket.
-        return FaultKind::None;
+        const FaultKind kind = select_outcome(streams_[static_cast<size_t>(cls)].uniform(), rule);
+        if (kind != FaultKind::None) ++injections_[slot];
+        return kind;
     }
 
     FaultConfig cfg_;
@@ -151,8 +139,7 @@ template <ClockLike Clock> class BasicFaultInjector {
     SiteCounterMap injections_{};
 };
 
-// Non-copyable and non-movable: a second object holding the same injector would pop a quiet window
-// it never pushed, re-enabling faults inside a critical section that is still running.
+// Non-movable too: a second owner would pop a quiet window it never pushed.
 template <typename Injector> class QuietGuard {
   public:
     explicit QuietGuard(Injector& injector) : injector_(injector) { injector_.push_quiet(); }
