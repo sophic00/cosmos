@@ -162,6 +162,10 @@ class VirtualClock {
         }
     }
 
+    // Test-only repositioning: injector gate tests need to move the clock backward to
+    // re-enter warmup/quiesce windows. Simulation code must use advance()/advance_to().
+    void set(Time t) { now_ = t; }
+
     int clock_gettime(clockid_t clk_id, struct timespec* tp) const {
         if (!tp) {
             errno = EFAULT;
