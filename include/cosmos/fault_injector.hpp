@@ -40,12 +40,6 @@ template <ClockLike Clock> class BasicFaultInjector {
         if (const auto checked = cfg.validate(node_count); !checked.has_value()) {
             return std::unexpected(checked.error());
         }
-        for (size_t slot = 0; slot < kSiteCount; ++slot) {
-            if (cfg.rules[slot].has_value() && cfg.rules[slot]->fire_on_eligible_call.has_value()) {
-                return std::unexpected(
-                    ConfigProblem{ConfigError::TriggerNotImplemented, site_at_slot(slot)});
-            }
-        }
         return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock);
     }
 
@@ -83,6 +77,14 @@ template <ClockLike Clock> class BasicFaultInjector {
 
         if (eligible_calls_[slot] <= rule->skip_first) return FaultKind::None;
         if (injections_[slot] >= rule->max_injections) return FaultKind::None;
+
+        // Entry 0 is the walk's zero point: every weight is positive, so a draw approaching 0
+        // always lands there. Reading it directly is what keeps the fire zero-draw (Rule 11) —
+        // passing 0.0 to select_outcome() would return None for the legal rate-0 trigger-only rule.
+        if (rule->fire_on_eligible_call == eligible_calls_[slot]) {
+            ++injections_[slot];
+            return rule->outcomes.entries[0].kind;
+        }
 
         return draw(site_class, slot, *rule);
     }

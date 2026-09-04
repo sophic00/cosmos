@@ -542,6 +542,18 @@ cfg.rules.emplace(SiteId::malloc, std::move(rule));
 
 The counter it checks is the **eligible-call count** as defined in §10 — incremented for calls that passed quiet/class/site/warmup, *before* `skip_first` and budget are checked — not the raw, unfiltered call count. This applies uniformly to every wrapper site: allocation, I/O, network, and clock.
 
+**Which outcome a trigger fires.** A triggered fire consumes no draw, so it cannot use §6.5's categorical walk to choose between a site's outcomes. It fires the **first** outcome in the rule's table. This is not a second convention bolted on beside the walk: `validate()` requires every weight to be strictly positive, so the walk selects entry 0 for any draw approaching zero, and a trigger is simply that same selection function evaluated at its floor. The weights therefore play no part in a triggered fire — they continue to govern every probabilistic fire on the same rule, including the other eligible calls of a rule carrying both a rate and a trigger.
+
+For a multi-outcome site, list the outcome the scenario is about first. Table order is already part of the reproduction contract (§12), and pinning the scripted kind to it is deliberate: weights are the kind of dimension a swarm may sample per universe (§6.4), and "fail exactly the 443rd write" has to mean the same failure in every universe rather than a different one per seed — a trigger is a fact, not a coin flip.
+
+```cpp
+FaultRule rule;
+rule.outcomes = {{FaultKind::ShortWrite, 1.0}, {FaultKind::WriteEio, 3.0}};
+rule.rate = 0.01;                  // other eligible calls stay probabilistic, 1:3 between the two
+rule.fire_on_eligible_call = 443;  // this one is scripted: ShortWrite, drew = no
+cfg.rules.emplace(SiteId::write, std::move(rule));
+```
+
 It does **not** apply to process/topology faults. There is no `crash()` symbol in the application's binary for the linker to wrap, so there is no "eligible call" to count — an occurrence trigger on `site::crash_node` is a category error, and `validate()` rejects it (§12). Episode faults get their own deterministic trigger form in §10.2.
 
 **Ledger entry:** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
@@ -993,7 +1005,6 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
-| Occurrence triggers (`fire_on_eligible_call`) | Not wired. `create()` rejects any config that sets one, with a temporary `ConfigError::TriggerNotImplemented` | F1: wiring the trigger deletes that enum member |
 | Episodes, ledger, `begin_quiesce()`, mode transitions | Absent | F1 (ledger), F6 (episodes, limits, mode) |
 
 **Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.

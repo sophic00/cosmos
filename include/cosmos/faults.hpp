@@ -292,8 +292,6 @@ enum class ConfigError : uint8_t {
     QuorumExceedsNodes,
     LimitsExceedNodes,
     BadWindowOrder,
-    // Not a config defect: this build fires no triggers yet, so the promise would go unmet.
-    TriggerNotImplemented,
 };
 
 // Carries the offending site so a rejected config says where, not just what.

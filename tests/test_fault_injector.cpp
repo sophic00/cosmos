@@ -2,6 +2,7 @@
 #include "cosmos/virtual_clock.hpp"
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <type_traits>
 #include <utility>
@@ -92,6 +93,14 @@ void expect_stream_at_start(Injector& injector) {
     Rng reference = storage_reference();
     expect_stream_matches(injector, reference, SiteId::open, FaultKind::OpenEio,
                           FaultKind::NoSpace);
+}
+
+// The open-side probe cannot be used when open itself carries the rule under test; write keeps
+// probe_config()'s two-outcome rule and shares the same Storage sub-stream.
+void expect_write_stream_at_start(Injector& injector) {
+    Rng reference = storage_reference();
+    expect_stream_matches(injector, reference, SiteId::write, FaultKind::WriteEio,
+                          FaultKind::ShortWrite);
 }
 
 void test_eligible_call_draws_exactly_once() {
@@ -351,21 +360,208 @@ void test_invalid_config_is_rejected() {
     std::cout << "[PASS] test_invalid_config_is_rejected" << std::endl;
 }
 
-void test_unwired_trigger_is_rejected() {
-    VirtualClock clock;
+FaultConfig trigger_config(uint64_t on_call, FaultRule rule) {
     FaultConfig cfg = probe_config();
-    FaultRule rule = two_outcome_rule(FaultKind::OpenEio, FaultKind::NoSpace);
-    rule.fire_on_eligible_call = 443;
+    rule.fire_on_eligible_call = on_call;
     must(cfg.set_rule(SiteId::open, rule));
+    return cfg;
+}
 
-    // P1-S4 wires the trigger. Until then the rule would draw a coin on the call it promised to
-    // fire on deterministically (§10.1), so the build refuses it rather than quietly misbehaving.
-    auto rejected = Injector::create(std::move(cfg), kSeed, kNodes, clock);
+FaultRule storage_rule(double rate, std::initializer_list<FaultKind> kinds) {
+    FaultRule rule;
+    rule.rate = rate;
+    double weight = 1.0;
+    for (FaultKind kind : kinds) {
+        must(rule.outcomes.add(kind, weight));
+        weight += 1.0;
+    }
+    return rule;
+}
+
+void test_trigger_fires_on_its_exact_eligible_call() {
+    constexpr uint64_t kOnCall = 443;
+
+    VirtualClock clock;
+    Injector injector =
+        make_injector(trigger_config(kOnCall, storage_rule(0.0, {FaultKind::OpenEio})), clock);
+
+    for (uint64_t call = 1; call <= kOnCall + 5; ++call) {
+        const FaultKind expected = call == kOnCall ? FaultKind::OpenEio : FaultKind::None;
+        assert(injector.decide(FaultClass::Storage, SiteId::open) == expected);
+    }
+    assert(injector.injections(SiteId::open) == 1);
+
+    std::cout << "[PASS] test_trigger_fires_on_its_exact_eligible_call" << std::endl;
+}
+
+// Rule 11 on the exact case where the walk would otherwise have been needed to choose.
+void test_trigger_fires_first_entry_without_drawing() {
+    VirtualClock clock;
+    Injector injector = make_injector(
+        trigger_config(2, storage_rule(0.0, {FaultKind::NoSpace, FaultKind::OpenEio})), clock);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::NoSpace);
+
+    expect_write_stream_at_start(injector);
+
+    std::cout << "[PASS] test_trigger_fires_first_entry_without_drawing" << std::endl;
+}
+
+// Weights are a probabilistic-path concept; P4 may sample them per universe, and a scripted
+// scenario must not change kind when it does.
+void test_trigger_kind_is_independent_of_weights() {
+    for (double heavy : {1.0, 5.0, 1000.0}) {
+        FaultRule rule;
+        rule.rate = 0.0;
+        must(rule.outcomes.add(FaultKind::OpenEio, 1.0));
+        must(rule.outcomes.add(FaultKind::NoSpace, heavy));
+
+        VirtualClock clock;
+        Injector injector = make_injector(trigger_config(1, rule), clock);
+        assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::OpenEio);
+    }
+
+    std::cout << "[PASS] test_trigger_kind_is_independent_of_weights" << std::endl;
+}
+
+// Table order is the control surface for a scripted fire, the way knob order is for sampling.
+void test_trigger_kind_follows_table_order() {
+    VirtualClock forward_clock;
+    Injector forward = make_injector(
+        trigger_config(1, storage_rule(0.0, {FaultKind::OpenEio, FaultKind::NoSpace})),
+        forward_clock);
+    assert(forward.decide(FaultClass::Storage, SiteId::open) == FaultKind::OpenEio);
+
+    VirtualClock reversed_clock;
+    Injector reversed = make_injector(
+        trigger_config(1, storage_rule(0.0, {FaultKind::NoSpace, FaultKind::OpenEio})),
+        reversed_clock);
+    assert(reversed.decide(FaultClass::Storage, SiteId::open) == FaultKind::NoSpace);
+
+    std::cout << "[PASS] test_trigger_kind_follows_table_order" << std::endl;
+}
+
+// A rate-0 rule never draws, so select_outcome(0.0, rule) would return None here and the scripted
+// fire would silently vanish on the most explicitly scripted config there is.
+void test_rate_zero_trigger_still_fires() {
+    VirtualClock clock;
+    Injector injector =
+        make_injector(trigger_config(3, storage_rule(0.0, {FaultKind::OpenEio})), clock);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::OpenEio);
+    assert(injector.injections(SiteId::open) == 1);
+
+    expect_write_stream_at_start(injector);
+
+    std::cout << "[PASS] test_rate_zero_trigger_still_fires" << std::endl;
+}
+
+void test_trigger_counts_eligible_calls_not_raw_calls() {
+    VirtualClock clock;
+    Injector injector =
+        make_injector(trigger_config(3, storage_rule(0.0, {FaultKind::OpenEio})), clock);
+
+    {
+        Guard guard(injector);
+        for (int i = 0; i < 5; ++i) {
+            assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+        }
+    }
+    assert(injector.eligible_calls(SiteId::open) == 0);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::OpenEio);
+
+    std::cout << "[PASS] test_trigger_counts_eligible_calls_not_raw_calls" << std::endl;
+}
+
+void test_spent_budget_blocks_a_matched_trigger() {
+    VirtualClock clock;
+    FaultRule rule = storage_rule(0.0, {FaultKind::OpenEio});
+    rule.max_injections = 0;
+    Injector injector = make_injector(trigger_config(1, rule), clock);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.injections(SiteId::open) == 0);
+    assert(injector.eligible_calls(SiteId::open) == 1);
+
+    expect_write_stream_at_start(injector);
+
+    std::cout << "[PASS] test_spent_budget_blocks_a_matched_trigger" << std::endl;
+}
+
+// A probabilistic fire spends the same budget a scripted one would have used.
+void test_probabilistic_fire_can_exhaust_a_triggers_budget() {
+    VirtualClock clock;
+    FaultRule rule = two_outcome_rule(FaultKind::OpenEio, FaultKind::NoSpace);
+    rule.max_injections = 1;
+    Injector injector = make_injector(trigger_config(2, rule), clock);
+
+    Rng reference = storage_reference();
+    assert(injector.decide(FaultClass::Storage, SiteId::open) ==
+           pick(reference.uniform(), FaultKind::OpenEio, FaultKind::NoSpace));
+    assert(injector.injections(SiteId::open) == 1);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.injections(SiteId::open) == 1);
+
+    std::cout << "[PASS] test_probabilistic_fire_can_exhaust_a_triggers_budget" << std::endl;
+}
+
+// The other budget direction: a scripted fire spends the budget a later probabilistic fire wanted.
+void test_trigger_fire_exhausts_the_budget_for_later_calls() {
+    VirtualClock clock;
+    FaultRule rule = two_outcome_rule(FaultKind::OpenEio, FaultKind::NoSpace);
+    rule.max_injections = 1;
+    Injector injector = make_injector(trigger_config(1, rule), clock);
+
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::OpenEio);
+    assert(injector.injections(SiteId::open) == 1);
+
+    // rate is 1.0, so this call would fire if the trigger had not already spent the budget.
+    assert(injector.decide(FaultClass::Storage, SiteId::open) == FaultKind::None);
+    assert(injector.injections(SiteId::open) == 1);
+
+    expect_write_stream_at_start(injector);
+
+    std::cout << "[PASS] test_trigger_fire_exhausts_the_budget_for_later_calls" << std::endl;
+}
+
+// The trigger call is the only one that skips the draw; the rest of the run is untouched.
+void test_trigger_consumes_no_draw_mid_run() {
+    VirtualClock clock;
+    FaultRule rule = two_outcome_rule(FaultKind::OpenEio, FaultKind::NoSpace);
+    Injector injector = make_injector(trigger_config(3, rule), clock);
+
+    Rng reference = storage_reference();
+    for (int call = 1; call <= 5; ++call) {
+        const FaultKind expected =
+            call == 3 ? FaultKind::OpenEio
+                      : pick(reference.uniform(), FaultKind::OpenEio, FaultKind::NoSpace);
+        assert(injector.decide(FaultClass::Storage, SiteId::open) == expected);
+    }
+
+    std::cout << "[PASS] test_trigger_consumes_no_draw_mid_run" << std::endl;
+}
+
+void test_trigger_below_skip_first_is_rejected() {
+    VirtualClock clock;
+    FaultRule rule = storage_rule(0.0, {FaultKind::OpenEio});
+    rule.skip_first = 5;
+
+    auto rejected = Injector::create(trigger_config(5, rule), kSeed, kNodes, clock);
     assert(!rejected.has_value());
-    assert(rejected.error().error == cosmos::ConfigError::TriggerNotImplemented);
+    assert(rejected.error().error == cosmos::ConfigError::TriggerLeSkipFirst);
     assert(rejected.error().site == SiteId::open);
 
-    std::cout << "[PASS] test_unwired_trigger_is_rejected" << std::endl;
+    auto accepted = Injector::create(trigger_config(6, rule), kSeed, kNodes, clock);
+    assert(accepted.has_value());
+
+    std::cout << "[PASS] test_trigger_below_skip_first_is_rejected" << std::endl;
 }
 
 void test_event_sites_decide_nothing() {
@@ -420,7 +616,17 @@ int main() {
     test_streams_are_independent_across_classes();
     test_quiesce_window_never_draws();
     test_invalid_config_is_rejected();
-    test_unwired_trigger_is_rejected();
+    test_trigger_fires_on_its_exact_eligible_call();
+    test_trigger_fires_first_entry_without_drawing();
+    test_trigger_kind_is_independent_of_weights();
+    test_trigger_kind_follows_table_order();
+    test_rate_zero_trigger_still_fires();
+    test_trigger_counts_eligible_calls_not_raw_calls();
+    test_spent_budget_blocks_a_matched_trigger();
+    test_probabilistic_fire_can_exhaust_a_triggers_budget();
+    test_trigger_fire_exhausts_the_budget_for_later_calls();
+    test_trigger_consumes_no_draw_mid_run();
+    test_trigger_below_skip_first_is_rejected();
     test_event_sites_decide_nothing();
     test_same_seed_replays_identically();
     std::cout << "All fault injector tests passed successfully!" << std::endl;
