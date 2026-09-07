@@ -1,4 +1,6 @@
+#include "cosmos/assert.hpp"
 #include "cosmos/cosmos.hpp"
+#include "cosmos/fault_injector.hpp"
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -129,6 +131,72 @@ void test_malloc_passes_through_after_current_is_cleared() {
     std::cout << "[PASS] test_malloc_passes_through_after_current_is_cleared" << std::endl;
 }
 
+// Scope is the documented context-management path: install on entry, restore the PREVIOUS
+// pointer on exit — not clear-to-null — so nesting unwinds in LIFO order.
+void test_scope_installs_and_restores() {
+    assert(!cosmos::Simulator::has_current());
+    {
+        cosmos::Simulator sim;
+        cosmos::Simulator::Scope scope(sim);
+        assert(cosmos::Simulator::current() == &sim);
+    }
+    assert(!cosmos::Simulator::has_current());
+    std::cout << "[PASS] test_scope_installs_and_restores" << std::endl;
+}
+
+void test_nested_scopes_unwind_in_lifo_order() {
+    cosmos::Simulator outer(1);
+    cosmos::Simulator inner(2);
+
+    {
+        cosmos::Simulator::Scope outer_scope(outer);
+        assert(cosmos::Simulator::current() == &outer);
+        {
+            cosmos::Simulator::Scope inner_scope(inner);
+            assert(cosmos::Simulator::current() == &inner);
+        }
+        assert(cosmos::Simulator::current() == &outer);
+    }
+    assert(!cosmos::Simulator::has_current());
+    std::cout << "[PASS] test_nested_scopes_unwind_in_lifo_order" << std::endl;
+}
+
+// Wrapped calls inside a Scope route to that scope's universe — the invariant the campaign's
+// per-universe Scope install relies on.
+void test_wrapped_malloc_routes_inside_scope() {
+    cosmos::Simulator sim;
+    {
+        cosmos::Simulator::Scope scope(sim);
+        void* ptr = malloc(64);
+        assert(ptr != nullptr);
+        assert(sim.heap().stats().active_allocations == 1);
+        free(ptr);
+        assert(sim.heap().stats().active_allocations == 0);
+    }
+    assert(!cosmos::Simulator::has_current());
+    std::cout << "[PASS] test_wrapped_malloc_routes_inside_scope" << std::endl;
+}
+
+// Placeholder contract: with no scheduler, the workload returning IS quiescence — the call is a
+// no-op that must be safe to repeat and must preserve findings recorded before it. The campaign
+// worker loop calls this unconditionally, which is the seam the real scheduler will fill.
+void test_run_until_quiescence_noop_contract() {
+    using namespace cosmos::literals;
+    cosmos::Simulator sim(5);
+    cosmos::Simulator::Scope scope(sim);
+    cosmos::always(false, "noop.before", "d");
+    assert(sim.findings().size() == 1);
+
+    sim.advance_time(1_s);
+    sim.run_until_quiescence();
+    sim.run_until_quiescence(); // idempotent: callable twice, still no-op
+    assert(sim.findings().size() == 1);
+    assert(sim.findings()[0].assertion_id == "noop.before");
+    assert(sim.now() == cosmos::Time::zero() + 1_s); // no hidden time advancement either
+
+    std::cout << "[PASS] test_run_until_quiescence_noop_contract" << std::endl;
+}
+
 // A tracked payload sits one header past its real allocation, so releasing it with no simulator
 // current used to hand the wrong address to the allocator and abort.
 void test_tracked_pointer_freed_with_no_current_simulator() {
@@ -228,6 +296,133 @@ void test_install_faults_rejects_an_invalid_config() {
     std::cout << "[PASS] test_install_faults_rejects_an_invalid_config" << std::endl;
 }
 
+// seed() reports exactly the seed the Simulator was built with, including the default: it is
+// the repro key campaign findings will print, so it must never drift from the ctor argument.
+void test_simulator_seed_accessor_reports_ctor_argument() {
+    cosmos::Simulator default_sim;
+    assert(default_sim.seed() == cosmos::kDefaultUniverseSeed);
+
+    cosmos::Simulator sim(42);
+    assert(sim.seed() == 42);
+
+    cosmos::Simulator zero_sim(0);
+    assert(zero_sim.seed() == 0);
+
+    cosmos::Simulator max_sim(~0ULL);
+    assert(max_sim.seed() == ~0ULL);
+
+    std::cout << "[PASS] test_simulator_seed_accessor_reports_ctor_argument" << std::endl;
+}
+
+// §4 interim contract: the trace digest is a function of the universe seed and the event
+// stream — same seed, same events, same digest; nothing else may move it.
+void test_trace_hash_is_deterministic_for_seed() {
+    cosmos::Simulator sim_a(42);
+    cosmos::Simulator sim_b(42);
+    cosmos::Simulator sim_c(43);
+
+    assert(sim_a.trace_hash() == sim_b.trace_hash());
+    assert(sim_a.trace_hash() != sim_c.trace_hash());
+
+    std::cout << "[PASS] test_trace_hash_is_deterministic_for_seed" << std::endl;
+}
+
+// Clock advances are events: equal advances hash equal, unequal streams diverge even when they
+// end at the same virtual time (50+50ms is a different event stream from one 100ms step).
+void test_trace_hash_tracks_clock_events() {
+    using namespace cosmos::literals;
+
+    cosmos::Simulator base(42);
+    const uint64_t untouched = base.trace_hash();
+
+    cosmos::Simulator sim_a(42);
+    sim_a.advance_time(100_ms);
+    assert(sim_a.trace_hash() != untouched);
+
+    cosmos::Simulator sim_b(42);
+    sim_b.advance_time(100_ms);
+    assert(sim_a.trace_hash() == sim_b.trace_hash());
+
+    cosmos::Simulator sim_c(42);
+    sim_c.advance_time(50_ms);
+    sim_c.advance_time(50_ms);
+    assert(sim_c.trace_hash() != sim_a.trace_hash());
+
+    cosmos::Simulator sim_d(42);
+    sim_d.advance_time(50_ms);
+    sim_d.clock().advance_to(cosmos::Time::zero() + 100_ms);
+    cosmos::Simulator sim_e(42);
+    sim_e.advance_time(100_ms);
+    assert(sim_d.trace_hash() != sim_e.trace_hash());
+
+    std::cout << "[PASS] test_trace_hash_tracks_clock_events" << std::endl;
+}
+
+// Fault fires are events too: a decide() that fires must land in the digest, identically across
+// two same-seed universes, and a universe without the fire must hash differently. install_faults
+// seeds the injector from the universe seed, so both universes fire identically.
+void test_trace_hash_reflects_fault_fires() {
+    const auto make_cfg = [] {
+        cosmos::FaultConfig cfg;
+        cfg.enable_class(cosmos::FaultClass::Memory);
+        assert(cfg.activate_site(cosmos::SiteId::malloc));
+        cosmos::FaultRule rule;
+        rule.rate = 1.0;
+        assert(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+        assert(cfg.set_rule(cosmos::SiteId::malloc, rule));
+        return cfg;
+    };
+
+    const auto fired_sim = [&make_cfg] {
+        cosmos::Simulator sim(42);
+        assert(sim.install_faults(make_cfg()).has_value());
+        const auto kind =
+            sim.injector_or_null()->decide(cosmos::FaultClass::Memory, cosmos::SiteId::malloc);
+        assert(kind == cosmos::FaultKind::OutOfMemory);
+        return sim.trace_hash();
+    };
+
+    const uint64_t with_fire = fired_sim();
+    assert(with_fire == fired_sim());
+
+    cosmos::Simulator no_fire(42);
+    assert(no_fire.install_faults(make_cfg()).has_value());
+    assert(with_fire != no_fire.trace_hash());
+
+    std::cout << "[PASS] test_trace_hash_reflects_fault_fires" << std::endl;
+}
+
+// The verify-mode shape (state-exploration.md §4): the same workload run twice through fresh
+// universes and consecutive Scopes on one thread must end with identical digests. Exercises all
+// four wrapped allocators — the pattern Campaign --verify will rely on. This is exactly the
+// comparison Campaign --verify will make.
+void test_trace_hash_is_stable_across_scope_swap_rerun() {
+    const auto run_workload = [] {
+        cosmos::Simulator sim(7);
+        cosmos::Simulator::Scope scope(sim);
+        void* a = malloc(64);
+        assert(a != nullptr);
+        void* b = calloc(4, 32);
+        assert(b != nullptr);
+        void* c = realloc(nullptr, 128); // realloc-as-malloc path
+        assert(c != nullptr);
+        c = realloc(c, 256); // tracked resize path
+        assert(c != nullptr);
+        free(a);
+        free(b);
+        free(c);
+        sim.advance_time(cosmos::Duration{250'000});
+        const uint64_t hash = sim.trace_hash();
+        assert(cosmos::Simulator::current() == &sim);
+        return hash;
+    };
+
+    assert(run_workload() == run_workload());
+    assert(!cosmos::Simulator::has_current()); // Scope restored through both consecutive runs
+
+    std::cout << "[PASS] test_trace_hash_is_stable_across_scope_swap_rerun" << std::endl;
+}
+
 void test_simulator_virtual_clock() {
     using namespace cosmos::literals;
     cosmos::Simulator sim;
@@ -252,9 +447,18 @@ int main() {
     test_malloc_passes_through_after_current_is_cleared();
     test_tracked_pointer_freed_with_no_current_simulator();
     test_destructor_clears_current();
+    test_scope_installs_and_restores();
+    test_nested_scopes_unwind_in_lifo_order();
+    test_wrapped_malloc_routes_inside_scope();
+    test_run_until_quiescence_noop_contract();
     test_install_faults_derives_the_fault_stream();
     test_install_faults_is_once_only();
     test_install_faults_rejects_an_invalid_config();
+    test_simulator_seed_accessor_reports_ctor_argument();
+    test_trace_hash_is_deterministic_for_seed();
+    test_trace_hash_tracks_clock_events();
+    test_trace_hash_reflects_fault_fires();
+    test_trace_hash_is_stable_across_scope_swap_rerun();
     test_simulator_virtual_clock();
     std::cout << "All simulator tests passed successfully!" << std::endl;
     return 0;
