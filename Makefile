@@ -1,4 +1,4 @@
-.PHONY: default build sim test all format format-check lint clean
+.PHONY: default build sim test all demo format format-check lint clean
 
 # Each devShell sets its own BUILD_DIR so toolchains never share a cmake cache.
 BUILD_DIR ?= build
@@ -9,6 +9,7 @@ default:
 	@echo "  make sim           - Build simulation binaries only"
 	@echo "  make test          - Build and run unit tests"
 	@echo "  make all           - Build production binaries, examples, and tests"
+	@echo "  make demo          - Run the 3-step cache demo (prod, tolerated fault, unhandled fault)"
 	@echo "  make format        - Format code with clang-format"
 	@echo "  make format-check  - Verify code formatting without modifying files"
 	@echo "  make lint          - Lint and verify code formatting"
@@ -30,6 +31,17 @@ test:
 all:
 	cmake -B $(BUILD_DIR) -DCOSMOS_BUILD_TESTS=ON
 	cmake --build $(BUILD_DIR) --parallel
+
+demo:
+	cmake -B $(BUILD_DIR) -DCOSMOS_BUILD_TESTS=OFF
+	cmake --build $(BUILD_DIR) --parallel --target cache_demo_prod cache_demo_sim
+	@echo "--- Step 1: normal run, no libcosmos (faults impossible) ---"
+	./$(BUILD_DIR)/examples/single_node/cache_demo_prod
+	@echo "--- Step 2: sim seed 1006 (PUT key14 OOM, tolerated) ---"
+	./$(BUILD_DIR)/examples/single_node/cache_demo_sim --seed 1006
+	@echo "--- Step 3: sim seed 991 (cache_create OOM, not handled; exit 1 is the finding) ---"
+	-./$(BUILD_DIR)/examples/single_node/cache_demo_sim --seed 991
+	@echo "--- Demo done: same app, three universes ---"
 
 format:
 	find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +

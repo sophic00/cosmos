@@ -28,6 +28,18 @@ all:
     cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
     cmake --build {{build_dir}} --parallel
 
+# Run the 3-step cache demo (prod, tolerated fault, unhandled fault)
+demo:
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=OFF
+    cmake --build {{build_dir}} --parallel --target cache_demo_prod cache_demo_sim
+    @echo "--- Step 1: normal run, no libcosmos (faults impossible) ---"
+    ./{{build_dir}}/examples/single_node/cache_demo_prod
+    @echo "--- Step 2: sim seed 1006 (PUT key14 OOM, tolerated) ---"
+    ./{{build_dir}}/examples/single_node/cache_demo_sim --seed 1006
+    @echo "--- Step 3: sim seed 991 (cache_create OOM, not handled; exit 1 is the finding) ---"
+    ./{{build_dir}}/examples/single_node/cache_demo_sim --seed 991 || true
+    @echo "--- Demo done: same app, three universes ---"
+
 # Format all C/C++ source and header files
 format:
     find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +
@@ -46,6 +58,7 @@ clean:
 alias b := build
 alias s := sim
 alias t := test
+alias d := demo
 alias fmt := format
 alias l := lint
 alias c := clean
