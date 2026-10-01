@@ -27,7 +27,7 @@ Deterministic Simulation Testing (DST) requires trapping and controlling all sou
 | Mechanism | Interposition Level | App Changes | C++ Header Safety | Overhead | Best Suited For |
 |---|---|---|---|---|---|
 | **Linker Wrapping (`-Wl,--wrap`)** | Linker / Symbol level | **Zero** (Standard POSIX C/C++) | ✅ **100% Safe** | Zero in Prod | In-process C/C++ libraries & systems (Cosmos library substrate) |
-| **Hypervisor VMCALL / Intercept** | Hardware / VM level | **Zero** (Unmodified OS VM image) | ✅ **100% Safe** | Microsecond VM traps | Unmodified guest OS binaries, multi-process clusters (Antithesis / Cosmos Phase 7) |
+| **Hypervisor VMCALL / Intercept** | Hardware / VM level | **Zero** (Unmodified OS VM image) | ✅ **100% Safe** | Microsecond VM traps | Unmodified guest OS binaries, multi-process clusters (Antithesis / Cosmos [Phase 7](roadmap.md#unified-roadmap)) |
 | **Dynamic `LD_PRELOAD`** | Dynamic Loader level | **Zero** | ✅ **100% Safe** | Minimal | Dynamic library override (has bootstrap/init ordering traps) |
 
 Cosmos adopts **Linker Symbol Wrapping (`-Wl,--wrap`)** as its primary substrate seam, enabling zero-code-change DST for C/POSIX applications without VM overhead.
@@ -67,7 +67,7 @@ Cosmos adopts **Linker Symbol Wrapping (`-Wl,--wrap`)** as its primary substrate
 
 - Fast full-guest snapshots: never replay from the beginning.
 - Enables: branch-the-past exploration; rewind-inspect; retroactive debugger attach; time compression of idle periods.
-- Cosmos analogue: `Snapshot` save/restore with in-process COW memory copies (Phase 5).
+- Cosmos analogue: `Snapshot` save/restore with in-process COW memory copies ([Phase 5](roadmap.md#unified-roadmap)).
 
 ---
 

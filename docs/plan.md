@@ -39,43 +39,22 @@ Full API reference: **`docs/design.md`**. Architecture & Seams: **`docs/architec
 | Concurrency Model | **Single-Threaded Fiber / Task Scheduler** | Intercepts `pthread_create` to run user-space tasks on one OS thread. The scheduler controls all interleavings. |
 | Memory Management | **Deterministic Tracked Heap** (`__wrap_malloc` / `__wrap_free`) | Heap allocator tracks allocations, checks for memory leaks, and injects OOM faults deterministically per seed. |
 | Exploration Engine | **Seeded fuzzing across parallel trials** | Each trial = 1 universe; parallelized across cores; coverage guidance (`sancov`) + `Snapshot`-based branching later. |
-| Hypervisor Substrate | **Future substrate** (`KvmSubstrate : ISubstrate`, Phase 7+) | Reuses the determinism engine via Seam B for unmodified multi-process guest OS VM binaries. |
+| Hypervisor Substrate | **Future substrate** (`KvmSubstrate : ISubstrate`, [Phase 7](roadmap.md#unified-roadmap)) | Reuses the determinism engine via Seam B for unmodified multi-process guest OS VM binaries. |
 | Production Binary | **Native POSIX Build (`-DCOSMOS_PROD`)** | Same app source, two binaries: `myapp_test` (links `libcosmos` with `--wrap`) and `myapp` (links native OS `libc`, normal OS process). |
 
 ---
 
 ## 2. What "Standard Library Mimicry DST" Means
 
-```mermaid
-graph TD
-    App["Application Source Code (100% Standard POSIX C/C++)<br><i>malloc(), free(), pthread_create(), clock_gettime(), socket(), send(), recv(), read(), write(), fsync(), getrandom()</i>"]
-    
-    App --> SwappingLayer["Build-Flag Swapping Layer"]
-    
-    subgraph ProdBranch ["Production Build (-DCOSMOS_PROD)"]
-        NativeOS["Native OS Process<br>• Real glibc heap<br>• Real kernel clock<br>• Real TCP/IP sockets<br>• Direct storage I/O<br><i>(Zero overhead execution)</i>"]
-    end
+**The layered diagram lives in [`architecture.md`](architecture.md#2-the-layered-model)** and is
+not redrawn here. An earlier revision of this document carried a third copy of it, which showed
+a simulated network and a campaign runner inside `libcosmos`; neither exists.
 
-    subgraph TestBranch ["Testing Build (-DCOSMOS_SIM)"]
-        WrapFlags["Linker Flags: -Wl,--wrap=malloc -Wl,--wrap=pthread_create -Wl,--wrap=send ..."]
-        
-        subgraph SimEngine ["libcosmos (Static Library)"]
-            Sched["Deterministic Single-Threaded Scheduler"]
-            VTime["Virtual Time (clock_gettime)"]
-            SimNet["Simulated Network (loss/delay/partitions)"]
-            TrackedHeap["Tracked Heap (OOM faults/leak check)"]
-            Runner["Campaign Runner & Repro Engine"]
-        end
-    end
-
-    SwappingLayer -- "Standard libc/OS sockets" --> NativeOS
-    SwappingLayer -- "Interposition Wrappers" --> WrapFlags
-    WrapFlags --> Sched
-    WrapFlags --> VTime
-    WrapFlags --> SimNet
-    WrapFlags --> TrackedHeap
-    WrapFlags --> Runner
-```
+In outline: application source, written against standard POSIX, goes through a build-flag
+swapping layer. A production link resolves POSIX calls straight to `libc` and the kernel with no
+wrapper objects and no runtime cost. A testing link adds `-Wl,--wrap=…` flags and statically
+links `libcosmos`, whose `__wrap_*` definitions route those calls into the deterministic engine —
+tracked heap, virtual clock, single-threaded fiber scheduler, seeded RNG, fault injection.
 
 One `Simulator` instance = one universe. A **campaign** runs thousands of
 universes with different seeds (across all cores), aggregates assertion
@@ -175,6 +154,9 @@ Four composable mechanisms (details in `docs/design.md` §9):
 
 ## 8. The Determinism Contract (User Obligations)
 
+**Superseded by [`determinism-contract.md`](determinism-contract.md),** which is the normative
+home for the contract, the determinism rules, and the build rules. The summary:
+
 Under `libcosmos`, determinism is guaranteed **if** application code obeys these rules:
 
 1. Use standard POSIX time APIs (`clock_gettime`, `gettimeofday`) - do not bypass wrapping to read hardware TSC directly.
@@ -182,29 +164,37 @@ Under `libcosmos`, determinism is guaranteed **if** application code obeys these
 3. Use standard POSIX threads / wrapped sockets - do not bypass wrapped `pthread_create` or un-wrapped OS sockets inside a simulation.
 4. Avoid iteration-order dependencies on raw pointer memory addresses (ASLR leaks).
 5. Floating point operations must avoid non-deterministic fast-math flags (`-ffast-math`) in behavior-critical paths.
+6. Issue no raw syscalls (`syscall(SYS_...)`).
+
+The guarantee is scoped to one compiler, one optimisation level, and one build type. See
+[`determinism-contract.md`](determinism-contract.md) §1.
 
 ---
 
 ## 9. Roadmap
 
-| Phase | Content | Exit criteria |
-|---|---|---|
-| 0 | Study notes & design specification - done (`docs/`) | Docs complete |
-| 1 | **Core Runtime & Linker Wrapper Engine**: `libcosmos` static library with `-Wl,--wrap` for `malloc`, `free`, `pthread_create`, `clock_gettime`, `getrandom`; virtual clock and fiber scheduler | Same seed ⇒ bit-identical trace hash; standard C app builds in both test and prod modes |
-| 2 | **Simulated Network & Socket Wrapping**: Linker wrapping for `socket`, `bind`, `connect`, `send`, `recv`; latency/loss/reorder/partition faults | Ping-pong application survives network faults deterministically |
-| 3 | **Workloads & Campaign Runner**: `gen::*` combinators, multi-core parallel campaign runner, repro CLI, double-run trace verification | 10k-seed campaign across cores; findings replay exactly |
-| 4 | **Simulated Storage & File Wrapping**: Linker wrapping for `open`, `read`, `write`, `fsync`; torn writes and crash durability model | KV store example detects lost-write bug under crash faults |
-| 5 | **Exploration v2/v3**: Sancov guidance, `Snapshot` branching, decision-log minimization, chrome-trace export | Minimized repro traces and branching map |
-| 6 | **Production Hardening**: Full native production build verification, packaging, comprehensive documentation | Example app runs reliably in both test and prod modes |
-| 7 | **Hypervisor Substrate**: `KvmSubstrate : ISubstrate` - run unmodified VM binaries deterministically | Reuses Phases 1-5 engine |
+**Superseded by [`roadmap.md`](roadmap.md#unified-roadmap),** which unifies the phase table that
+used to live here with the sprint table from [`fault-injection.md`](fault-injection.md) and with
+the register of defects in the shipped code. That document is the only place a phase or sprint
+status is recorded.
+
+Two rows are worth noting here because they changed status:
+
+- The phase that was here as "core runtime and linker wrapper engine" is `partial`: its exit
+  criterion of a bit-identical trace hash was never met, and neither was the `--verify` mode or
+  the coverage-guidance work that later phases assumed.
+- The phase that was here as "hypervisor substrate" is now `wont-do`. See
+  [`future-substrate.md`](future-substrate.md).
 
 ---
 
 ## 10. Risks
 
-1. **Unwrapped OS Calls**: Third-party code bypassing wrapped POSIX functions to call raw syscalls (`syscall(SYS_...)`). Mitigated by `--verify` mode and interposition traps.
-2. **ASLR / Pointer Order Leaks**: Unordered containers keyed by raw pointer values (`std::unordered_map<T*>`). Mitigated by deterministic allocation layouts in `__wrap_malloc`.
-3. **Fiber Context Switch Overhead**: Mitigated by custom lightweight fiber context switching.
+1. **Unwrapped OS Calls**: Third-party code bypassing wrapped POSIX functions to call raw syscalls (`syscall(SYS_...)`). **Not mitigated.** The `--verify` mode and interposition traps this line previously claimed do not exist; they are [F5](roadmap.md#unified-roadmap). Today this is a stated user obligation.
+2. **ASLR / Pointer Order Leaks**: Unordered containers keyed by raw pointer values (`std::unordered_map<T*>`). **Partly mitigated** by deterministic allocation layouts in `__wrap_malloc`; the application-side obligation stands.
+3. **Fiber Context Switch Overhead**: Mitigated by custom lightweight fiber context switching. Not benchmarked.
+4. **Partially wrapped POSIX families**: `epoll`, `poll`, `select`, `mmap`, `sigaction`, `pread`, rwlocks, barriers, semaphores and others reach the host with no diagnostic. The pthread gap is the dangerous one — see [DEF-17](roadmap.md#known-defects).
+5. **Silent no-op fault configuration**: `validate()` accepts rules that can never fire. See [DEF-9](roadmap.md#known-defects) and [I10](architecture.md#6-invariants).
 
 ---
 
@@ -213,23 +203,37 @@ Under `libcosmos`, determinism is guaranteed **if** application code obeys these
 ```
 cosmos/
 ├── README.md                    ← project summary & quick start
-├── CMakeLists.txt               ← defines libcosmos static library, examples
+├── CMakeLists.txt               ← top-level build
+├── Justfile / Makefile          ← format, lint, test, build entry points
 ├── docs/
+│   ├── roadmap.md               ← single source of truth for status & known defects
+│   ├── architecture.md          ← structure, interposition layer, invariants
+│   ├── design.md                ← POSIX taxonomy & public API reference
+│   ├── fault-injection.md       ← fault model, gate chain, ledger, worked example
+│   ├── determinism-contract.md  ← guarantees, obligations, rules, boundaries
+│   ├── writing-a-wrapper.md     ← contribution path for the interposition layer
+│   ├── testing.md               ← test build conventions & target inventory
+│   ├── IMPLEMENTATION_NOTES.md  ← what -Wl,--wrap actually reaches
+│   ├── linker-interposition.md  ← the --wrap / __real_* mechanism
+│   ├── future-substrate.md      ← demoted: ISubstrate / snapshot (not implemented)
 │   ├── plan.md                  ← this file
-│   ├── architecture.md          ← build-flag layer, linker interposition, substrate seams
-│   ├── design.md                ← full POSIX API taxonomy & public header reference
 │   └── antithesis-study-notes.md← research background
-├── include/cosmos/              ← public headers (sim engine & campaign harness)
-│   ├── cosmos.hpp  task.hpp  time.hpp  random.hpp
-│   ├── simulator.hpp  net.hpp  faults.hpp  gen.hpp  assert.hpp  campaign.hpp
-│   └── (storage.hpp - Phase 4)
-├── src/cosmos/                  ← libcosmos: __wrap_* functions, Universe, ISubstrate, SimSubstrate
+├── include/cosmos/              ← public headers
+│   ├── core:      time.hpp  random.hpp  memory.hpp  task.hpp
+│   │              faults.hpp  fault_injector.hpp  ledger.hpp  ledger_print.hpp
+│   ├── harness:   simulator.hpp  scenario.hpp
+│   ├── umbrella:  cosmos.hpp      ← partial; includes 4 of 14 headers
+│   ├── shim:      virtual_clock.hpp
+│   └── stubs:     net.hpp  gen.hpp  assert.hpp  campaign.hpp   ← empty, not implemented
+├── src/cosmos/
+│   ├── CMakeLists.txt
+│   ├── cosmos.cpp               ← empty translation unit
+│   ├── task.cpp                 ← the ucontext fiber scheduler
+│   └── wrappers/
+│       ├── wrapper_fault.hpp    ← shared adapter policy (internal by placement)
+│       └── wrap_{memory,time,random,storage,threads,net}.cpp
+├── tests/                       ← 18 assert-based CTest binaries
 └── examples/
-    ├── CMakeLists.txt           ← builds single_node and distributed targets
-    ├── single_node/             ← single binary example: transactional WAL storage engine (crash durability & OOM faults)
-    │   ├── CMakeLists.txt
-    │   └── kv_store.c
-    └── distributed/             # distributed example: replicated consensus cluster (network partitions & reordering)
-        ├── CMakeLists.txt
-        └── replicated_kv.c
+    ├── single_node/             ← kv_store.c placeholder, broken_cache.c real fixture
+    └── distributed/             ← replicated_kv.c placeholder
 ```

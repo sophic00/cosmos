@@ -30,10 +30,16 @@ The `-Wl,--wrap=<symbol>` linker option provided by GNU `ld` and LLVM `lld` perf
 
 ---
 
-## 3. Codebase Implementation & Example
+## 3. Illustration, and where the real code is
 
-### A. Wrapper Source File
-In [`src/cosmos/wrappers/wrap_memory.cpp`](file:///home/vaibhav/work/cosmos/src/cosmos/wrappers/wrap_memory.cpp):
+The snippets below show the **mechanism**. They are deliberately minimal and are not the
+repository's actual wrapper code — the real wrappers add a reentrancy guard, a null-universe
+check, an eligibility predicate, and a fault decision. For the real thing see
+[`wrap_memory.cpp`](../src/cosmos/wrappers/wrap_memory.cpp) and the walkthrough in
+[`architecture.md`](architecture.md#43-a-wrapper-for-real). For the full boundary analysis see
+[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+
+### A. The shape of a wrapper
 
 ```cpp
 #include <cstddef>
@@ -53,28 +59,27 @@ void* __wrap_malloc(size_t size) {
 } // extern "C"
 ```
 
-### B. CMake Build Configuration
-In [`examples/single_node/CMakeLists.txt`](file:///home/vaibhav/work/cosmos/examples/single_node/CMakeLists.txt):
+### B. The shape of the build configuration
 
 ```cmake
-add_executable(kv_store_sim kv_store.c)
-target_link_libraries(kv_store_sim PRIVATE cosmos)
+add_executable(myapp_sim myapp.c)
+target_link_libraries(myapp_sim PRIVATE cosmos)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_link_options(kv_store_sim PRIVATE
+    target_link_options(myapp_sim PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
-        "-Wl,--wrap=pthread_create"
         "-Wl,--wrap=clock_gettime"
-        "-Wl,--wrap=open"
-        "-Wl,--wrap=read"
         "-Wl,--wrap=write"
-        "-Wl,--wrap=fsync"
-        "-Wl,--wrap=getrandom"
     )
 endif()
 ```
+
+The repository's real lists are much longer — [`examples/single_node/CMakeLists.txt`](../examples/single_node/CMakeLists.txt)
+passes **34** wrap flags to `kv_store_sim`, covering the memory, time, storage, random, and
+pthread families. Every consumer target carries its own list, because subset wrapping is per
+target.
 
 ---
 
@@ -102,7 +107,34 @@ endif()
 
 ## 5. Technical Considerations & Best Practices
 
+Three flags cooperate to make interposition reliable. All three are required; the third is the
+one most often missed.
+
 1. **Link-Time Garbage Collection (`-ffunction-sections` + `-Wl,--gc-sections`)**:
-   In Cosmos ([`src/cosmos/CMakeLists.txt`](file:///home/vaibhav/work/cosmos/src/cosmos/CMakeLists.txt)), each `__wrap_*` symbol is built with `-ffunction-sections`. This ensures that if a target binary wraps a subset of symbols (e.g. `malloc` but not `calloc`), `-Wl,--gc-sections` discards unused `__wrap_*` functions and prevents undefined references to un-wrapped `__real_*` symbols.
+   In Cosmos ([`src/cosmos/CMakeLists.txt`](../src/cosmos/CMakeLists.txt)), each `__wrap_*` symbol is built with `-ffunction-sections`. This ensures that if a target binary wraps a subset of symbols (e.g. `malloc` but not `calloc`), `-Wl,--gc-sections` discards unused `__wrap_*` functions and prevents undefined references to un-wrapped `__real_*` symbols.
 2. **Same Translation Unit Direct Calls**:
    If a function call and definition exist in the same translation unit, compilers may optimize calls directly without generating an undefined symbol reference in the object file relocations. Interposition via `--wrap` applies strictly to calls resolved across translation units / object boundaries.
+3. **Compiler Builtins (`-fno-builtin-X`)**:
+   This is the flag most likely to be forgotten, and its absence is silent. For a function with a
+   compiler builtin — `malloc`, `free`, `calloc`, `realloc`, `random`, `rand`, `srand`,
+   `srandom`, among others — the optimiser may fold the call into an intrinsic, inline it, or
+   prove it redundant. When that happens **no undefined reference is emitted at all**, so there is
+   nothing for `--wrap` to rewrite. The wrapper is compiled, linked, present in the binary, and
+   never called.
+
+   Cosmos handles this in [`src/cosmos/CMakeLists.txt`](../src/cosmos/CMakeLists.txt) by adding
+   `-fno-builtin-malloc`, `-fno-builtin-free`, `-fno-builtin-calloc`, `-fno-builtin-realloc`,
+   `-fno-builtin-random`, `-fno-builtin-rand`, `-fno-builtin-srand`, `-fno-builtin-srandom` — and
+   propagating them as an `INTERFACE` option so that any consumer of `libcosmos` inherits them and
+   cannot silently lose interposition by forgetting the flag.
+
+   When adding a wrapper for a function that has a builtin, add its `-fno-builtin-X` too. See
+   [`writing-a-wrapper.md`](writing-a-wrapper.md) §5.
+
+   Note that `-ffunction-sections` and `--gc-sections` solve a *different* problem — dropping
+   wrappers you did not ask for. `-fno-builtin-X` solves the problem of the wrapper you *did* ask
+   for never being reached. Both symptoms look like "my wrapper is not running".
+
+For the complete list of what `--wrap` structurally cannot reach — fortified glibc variants such
+as `__read_chk`, `operator new` under a shared `libstdc++` link, raw syscalls, and unwrapped POSIX
+families — see [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
