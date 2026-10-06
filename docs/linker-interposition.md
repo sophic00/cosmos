@@ -54,7 +54,15 @@ void* __wrap_malloc(size_t size) {
 ```
 
 ### B. CMake Build Configuration
-In [`examples/single_node/CMakeLists.txt`](file:///home/vaibhav/work/cosmos/examples/single_node/CMakeLists.txt):
+
+Every simulation binary declares its own subset: `-Wl,--wrap` is per-symbol, so a binary only
+reaches the wrappers it lists. Listing a site's *fortified alias* next to the site is not optional
+— `-D_FORTIFY_SOURCE` rewrites the call before the linker sees it, and the alias is a different
+symbol (`__read_chk`, `__open_2`, `__recv_chk`, `__poll_chk`).
+
+The authoritative full list is [`examples/single_node/CMakeLists.txt`](../../examples/single_node/CMakeLists.txt)
+(the distributed example wraps the memory, pthread and network families; the test suites wrap more,
+including the fortified aliases and `poll`/`fcntl`). Its shape:
 
 ```cmake
 add_executable(kv_store_sim kv_store.c)
@@ -62,19 +70,59 @@ target_link_libraries(kv_store_sim PRIVATE cosmos)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(kv_store_sim PRIVATE
+        # Every wrapper must stay opaque to the optimizer, or the call never leaves the binary.
         "-Wl,--gc-sections"
+        # Memory (SiteId::malloc / calloc / realloc)
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        # Threads and scheduling
         "-Wl,--wrap=pthread_create"
+        "-Wl,--wrap=pthread_join"
+        "-Wl,--wrap=pthread_detach"
+        "-Wl,--wrap=pthread_self"
+        "-Wl,--wrap=pthread_equal"
+        "-Wl,--wrap=pthread_exit"
+        "-Wl,--wrap=pthread_mutex_init"
+        "-Wl,--wrap=pthread_mutex_destroy"
+        "-Wl,--wrap=pthread_mutex_lock"
+        "-Wl,--wrap=pthread_mutex_unlock"
+        "-Wl,--wrap=pthread_mutex_trylock"
+        "-Wl,--wrap=pthread_cond_init"
+        "-Wl,--wrap=pthread_cond_destroy"
+        "-Wl,--wrap=pthread_cond_wait"
+        "-Wl,--wrap=pthread_cond_signal"
+        "-Wl,--wrap=pthread_cond_broadcast"
+        "-Wl,--wrap=sched_yield"
+        # Clock (SiteId::clock_gettime / nanosleep)
         "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+        # Storage (SiteId::open / read / write / fsync), with the fortified read alias
         "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
         "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
         "-Wl,--wrap=fsync"
+        # Random (SiteId::getrandom)
         "-Wl,--wrap=getrandom"
+        "-Wl,--wrap=random"
+        "-Wl,--wrap=rand"
+        "-Wl,--wrap=srandom"
+        "-Wl,--wrap=srand"
     )
 endif()
 ```
+
+The network family (`socket`, `socketpair`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`,
+`__recv_chk`, `shutdown`, `close`, `poll`, `__poll_chk`, `fcntl`, `getsockname`, `getpeername`,
+`setsockopt`, `getsockopt`) stays out of this list on purpose: it is the test suites' transport
+surface. A binary that opens sockets under simulation must add it, or those calls reach the host.
 
 ---
 

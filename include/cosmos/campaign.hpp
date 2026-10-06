@@ -208,7 +208,7 @@ inline void flush_report_to_disk(const std::string& path, const CampaignReport& 
 //   2. Scope scope(sim) — RAII context install, never manual set_current()
 //   3. build_fn(sim, seed) — the user workload + assertions (the IDENTICAL build_fn that
 //      run_single receives; factor it into a named function, or repro runs will diverge)
-//   4. sim.run_until_quiescence()
+//   4. sim.scheduler().run_until_quiescence()
 //   5. verify mode: run sim2 through a second Scope on the same thread with the same seed and
 //      compare live trace hashes; a mismatch is itself a finding ("determinism.violation"),
 //      recorded and kept campaigning — never an abort
@@ -269,7 +269,7 @@ template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build
                 Simulator sim(seed);
                 Simulator::Scope scope(sim);
                 build_fn(sim, seed);
-                sim.run_until_quiescence();
+                sim.scheduler().run_until_quiescence();
 
                 for (const Failure& failure : sim.findings()) {
                     shards[worker_id].findings.push_back(failure);
@@ -280,7 +280,7 @@ template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build
                     Simulator sim2(seed);
                     Simulator::Scope scope2(sim2);
                     build_fn(sim2, seed);
-                    sim2.run_until_quiescence();
+                    sim2.scheduler().run_until_quiescence();
                     if (sim.trace_hash() != sim2.trace_hash()) {
                         // A determinism-contract violation is itself a finding (§8). The
                         // diverging hash pair goes in the detail so the report names it.
@@ -328,7 +328,7 @@ template <typename BuildFn> int run_single(uint64_t seed, BuildFn build_fn) {
     Simulator sim(seed);
     Simulator::Scope scope(sim);
     build_fn(sim, seed);
-    sim.run_until_quiescence();
+    sim.scheduler().run_until_quiescence();
 
     for (const Failure& failure : sim.findings()) {
         std::fprintf(stderr, "FINDING: %s (seed %llu): %s\n", failure.assertion_id.c_str(),

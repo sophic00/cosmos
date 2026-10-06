@@ -175,7 +175,6 @@ struct HeapStats {
     size_t total_allocated_bytes = 0;
     size_t active_allocations = 0;
     size_t total_allocation_count = 0;
-    size_t oom_fault_count = 0;
 };
 
 /**
@@ -224,6 +223,8 @@ class TrackedHeap {
         size_t total_size = header_size + size;
         void* raw = __real_malloc(total_size);
         if (!raw) {
+            // A genuine host failure, not an injected one: malloc's contract still owes ENOMEM.
+            errno = ENOMEM;
             return nullptr;
         }
 
@@ -311,8 +312,6 @@ class TrackedHeap {
         deallocate(user_ptr);
         return new_ptr;
     }
-
-    void record_oom() { stats_.oom_fault_count++; }
 
     const HeapStats& stats() const { return stats_; }
     size_t active_count() const { return stats_.active_allocations; }

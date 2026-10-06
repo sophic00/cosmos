@@ -97,26 +97,51 @@ class Scenario {
         workload();
     }
 
-    // §9.3's faults-off half, as a permanent quiet window; P6 swaps in begin_quiesce() + drain
-    // without moving the call site. Load-bearing whenever the universe is made current again after
-    // the run — an oracle reading persisted state does exactly that.
+    // §9.3's faults-off half, as a permanent quiet window, plus the fiber
+    // drain: remaining tasks run to quiescence with faults OFF. Load-bearing
+    // whenever the universe is made current again after the run — an oracle
+    // reading persisted state does exactly that.
     void quiesce() {
         if (quiesced_) return;
         quiesced_ = true;
         // A scenario that never ran its workload would otherwise report PASSED: the harness must
         // not be capable of the vacuous pass §11.4 exists to catch.
-        // Snapshot first: record_lifecycle allocates, and if this universe happens to be current
-        // the complaint would land in the count it is about to describe.
-        report_.active_allocations = sim_->heap().active_count();
-        if (!ran_) record_lifecycle("quiesce() called without run()");
-        auto* injector = sim_->injector_or_null();
-        if (injector == nullptr) return;
-        injector->push_quiet();
-        for (size_t slot = 0; slot < kSiteCount; ++slot) {
-            const SiteId site = site_at_slot(slot);
-            report_.eligible_calls[slot] = injector->eligible_calls(site);
-            report_.injections[slot] = injector->injections(site);
+        // Snapshot first in this path only: record_lifecycle allocates, and if this universe
+        // happens to be current the complaint would land in the count it is about to describe
+        // (observable under -static-libstdc++, where operator new reaches the wrappers). The
+        // early return below keeps that snapshot, so harness bookkeeping never rewrites it.
+        if (!ran_) {
+            report_.active_allocations = sim_->heap().active_count();
+            record_lifecycle("quiesce() called without run()");
+            auto* early_injector = sim_->injector_or_null();
+            if (early_injector != nullptr) early_injector->push_quiet();
+            {
+                CurrentGuard guard(*sim_);
+                sim_->scheduler().run_until_quiescence();
+            }
+            return;
         }
+        auto* injector = sim_->injector_or_null();
+        if (injector != nullptr) injector->push_quiet();
+        bool saw_deadlock = false;
+        {
+            CurrentGuard guard(*sim_);
+            sim_->scheduler().run_until_quiescence();
+            saw_deadlock = sim_->scheduler().deadlocked();
+            // Snapshot under guard but drain itself uses __real_malloc only, so
+            // no tracked allocation can land between the drain and this read.
+            report_.active_allocations = sim_->heap().active_count();
+            if (injector != nullptr) {
+                for (size_t slot = 0; slot < kSiteCount; ++slot) {
+                    const SiteId site = site_at_slot(slot);
+                    report_.eligible_calls[slot] = injector->eligible_calls(site);
+                    report_.injections[slot] = injector->injections(site);
+                }
+            }
+        }
+        // Outside the guard so the detail string cannot become a tracked block
+        // the snapshot above just claimed to describe.
+        if (saw_deadlock) record_lifecycle("deadlock detected during quiesce drain");
     }
 
     // The oracle is deliberately not evaluated out of order: the world has not settled, so its

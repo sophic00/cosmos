@@ -60,9 +60,19 @@ void test_passthrough_no_sim() {
     int ir = rand();
     assert(ir >= 0 && ir <= RAND_MAX);
 
-    // No-op wrappers must not crash outside a sim either.
-    srandom(12345);
-    srand(6789);
+    // Outside a universe, seeding reaches the host RNG like every other passthrough call: the
+    // same seed must reproduce the same next draw. (Inside a universe seeding is a no-op; that
+    // half of the contract is pinned by test_srandom_srand_are_noops.)
+    srand(7);
+    const int seeded_a = rand();
+    srand(7);
+    const int seeded_b = rand();
+    assert(seeded_a == seeded_b);
+    srandom(8);
+    const long seeded_c = random();
+    srandom(8);
+    const long seeded_d = random();
+    assert(seeded_c == seeded_d);
 
     std::cout << "[PASS] test_passthrough_no_sim" << std::endl;
 }

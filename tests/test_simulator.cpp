@@ -177,9 +177,10 @@ void test_wrapped_malloc_routes_inside_scope() {
     std::cout << "[PASS] test_wrapped_malloc_routes_inside_scope" << std::endl;
 }
 
-// Placeholder contract: with no scheduler, the workload returning IS quiescence — the call is a
-// no-op that must be safe to repeat and must preserve findings recorded before it. The campaign
-// worker loop calls this unconditionally, which is the seam the real scheduler will fill.
+// Empty-universe drain contract: the scheduler's run_until_quiescence with no fibers and no
+// timers returns immediately — findings recorded before it are preserved, the call is safe to
+// repeat, and no virtual time hides past the drain. The campaign worker loop calls this
+// unconditionally, which is the seam the scheduler fills for real workloads.
 void test_run_until_quiescence_noop_contract() {
     using namespace cosmos::literals;
     cosmos::Simulator sim(5);
@@ -188,8 +189,8 @@ void test_run_until_quiescence_noop_contract() {
     assert(sim.findings().size() == 1);
 
     sim.advance_time(1_s);
-    sim.run_until_quiescence();
-    sim.run_until_quiescence(); // idempotent: callable twice, still no-op
+    sim.scheduler().run_until_quiescence();
+    sim.scheduler().run_until_quiescence(); // idempotent: callable twice, still no-op
     assert(sim.findings().size() == 1);
     assert(sim.findings()[0].assertion_id == "noop.before");
     assert(sim.now() == cosmos::Time::zero() + 1_s); // no hidden time advancement either

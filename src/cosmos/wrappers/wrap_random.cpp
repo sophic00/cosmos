@@ -34,6 +34,8 @@ extern "C" {
 ssize_t __real_getrandom(void* buf, size_t buflen, unsigned int flags);
 long int __real_random(void);
 int __real_rand(void);
+void __real_srandom(unsigned int seed);
+void __real_srand(unsigned int seed);
 
 ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
     if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
@@ -107,9 +109,24 @@ int __wrap_rand(void) {
     return static_cast<int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
 }
 
-// No-ops on purpose: host seeding must not perturb the User stream.
-void __wrap_srandom(unsigned int seed) { (void)seed; }
+// Without a universe this is host code seeding the host RNG, and it reaches the real call like
+// every other passthrough wrapper — a sim binary's non-simulation phases must not behave
+// differently from the prod binary. With a universe it stays a no-op: host seeding must not
+// perturb the User stream, and universe values must not depend on app seeding order.
+void __wrap_srandom(unsigned int seed) {
+    if (!cosmos::Simulator::has_current()) {
+        __real_srandom(seed);
+        return;
+    }
+    (void)seed;
+}
 
-void __wrap_srand(unsigned int seed) { (void)seed; }
+void __wrap_srand(unsigned int seed) {
+    if (!cosmos::Simulator::has_current()) {
+        __real_srand(seed);
+        return;
+    }
+    (void)seed;
+}
 
 } // extern "C"

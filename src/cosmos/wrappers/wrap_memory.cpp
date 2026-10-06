@@ -21,7 +21,7 @@ void free_orphaned_block(void* ptr) {
 }
 
 // Never faulted: the block never belonged to the currently active universe.
-void* reallocate_orphaned_block(void* ptr, size_t new_size) {
+void* reallocate_orphaned_block(void* ptr, size_t new_size, bool engine_call) {
     auto* header = cosmos::header_for(ptr);
     if (header->magic != cosmos::COSMOS_CANARY_MAGIC) {
         errno = ENOMEM;
@@ -29,7 +29,11 @@ void* reallocate_orphaned_block(void* ptr, size_t new_size) {
     }
 
     const size_t old_size = header->requested_size;
-    void* new_ptr = cosmos::Simulator::has_current()
+    // Engine work must not pollute the sim heap (mirrors malloc/calloc passthrough):
+    // a tracked orphan reallocated by the engine becomes an untracked host block.
+    // engine_call is sampled before the wrapper's guard (which is held here), so it
+    // must be passed in rather than re-reading in_wrapper_logic.
+    void* new_ptr = (cosmos::Simulator::has_current() && !engine_call)
                         ? cosmos::Simulator::current()->heap().allocate(new_size)
                         : __real_malloc(new_size);
     if (!new_ptr) {
@@ -66,7 +70,6 @@ void* __wrap_malloc(size_t size) {
     // Decided before the heap is touched, so a fired OOM leaves TrackedHeap exactly as it was.
     if (cosmos::wrappers::memory_alloc_eligible(size) && decided_oom(sim, cosmos::SiteId::malloc)) {
         errno = ENOMEM;
-        sim->heap().record_oom();
         return nullptr;
     }
 
@@ -75,14 +78,11 @@ void* __wrap_malloc(size_t size) {
 
 void __wrap_free(void* ptr) {
     if (!ptr) return;
-
-    if (cosmos::wrappers::in_wrapper_logic) {
-        __real_free(ptr);
-        return;
-    }
     cosmos::wrappers::ReentrancyGuard guard;
 
-    // Ownership-based, not context-based: a cross-simulator free must update the owning heap.
+    // Ownership-based, not context-based (Rule 7): an engine call that frees an application block
+    // must still reach that block's heap. Handing a sim payload to __real_free would release the
+    // address header_size past the block and corrupt the host allocator instead.
     auto ownership = cosmos::detail::AllocRegistry::instance().ownership_of(ptr);
     if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
         ownership.owner->deallocate(ptr);
@@ -111,7 +111,6 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
 
     if (decided_oom(sim, cosmos::SiteId::calloc)) {
         errno = ENOMEM;
-        sim->heap().record_oom();
         return nullptr;
     }
 
@@ -124,9 +123,9 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
 }
 
 void* __wrap_realloc(void* ptr, size_t size) {
-    if (cosmos::wrappers::in_wrapper_logic) {
-        return __real_realloc(ptr, size);
-    }
+    // Rule 7: an engine call must not spend a Memory draw, but it must still route by ownership --
+    // a tracked payload handed to __real_realloc would be reallocated from its header offset.
+    const bool engine_call = cosmos::wrappers::in_wrapper_logic;
     cosmos::wrappers::ReentrancyGuard guard;
 
     auto ownership = cosmos::detail::AllocRegistry::instance().ownership_of(ptr);
@@ -143,26 +142,24 @@ void* __wrap_realloc(void* ptr, size_t size) {
     }
 
     if (!ptr) {
-        if (!cosmos::Simulator::has_current()) {
+        if (!cosmos::Simulator::has_current() || engine_call) {
             return __real_malloc(size);
         }
         auto* sim = cosmos::Simulator::current();
         if (cosmos::wrappers::memory_realloc_eligible(ptr, size, /*owned_by_sim=*/false) &&
             decided_oom(sim, cosmos::SiteId::realloc)) {
             errno = ENOMEM;
-            sim->heap().record_oom();
             return nullptr;
         }
         return sim->heap().allocate(size);
     }
 
     if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
-        if (cosmos::Simulator::has_current()) {
+        if (!engine_call && cosmos::Simulator::has_current()) {
             auto* sim = cosmos::Simulator::current();
             if (cosmos::wrappers::memory_realloc_eligible(ptr, size, sim->heap().owns(ptr)) &&
                 decided_oom(sim, cosmos::SiteId::realloc)) {
                 errno = ENOMEM;
-                sim->heap().record_oom();
                 return nullptr;
             }
         }
@@ -174,7 +171,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
     }
 
     if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
-        return reallocate_orphaned_block(ptr, size);
+        return reallocate_orphaned_block(ptr, size, engine_call);
     }
 
     return __real_realloc(ptr, size);

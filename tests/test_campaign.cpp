@@ -205,14 +205,14 @@ void test_run_single_contract() {
         cosmos::Simulator sim(seed);
         cosmos::Simulator::Scope scope(sim);
         planted_violation_workload(sim, seed);
-        sim.run_until_quiescence();
+        sim.scheduler().run_until_quiescence();
         return sim.trace_hash();
     };
     cosmos::Simulator direct(1002);
     {
         cosmos::Simulator::Scope scope(direct);
         planted_violation_workload(direct, 1002);
-        direct.run_until_quiescence();
+        direct.scheduler().run_until_quiescence();
     }
     assert(hash_via_run_single(1002) == direct.trace_hash());
 

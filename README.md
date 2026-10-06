@@ -61,3 +61,9 @@ ctest --test-dir build --output-on-failure
 
 - [`examples/single_node/`](examples/single_node/) – Transactional WAL storage engine (crash durability & OOM fault injection).
 - [`examples/distributed/`](examples/distributed/) – Replicated consensus cluster (network partitions & message reordering).
+
+## LLM Usage Policy
+
+This repository contains a mix of hand-written and LLM-generated code. Regardless
+of origin, all code is thoroughly reviewed and discussed at length before it is
+merged into the main branch.

@@ -1,5 +1,7 @@
 add_library(cosmos STATIC
     cosmos.cpp
+    task.cpp
+    net.cpp
     wrappers/wrap_memory.cpp
     wrappers/wrap_threads.cpp
     wrappers/wrap_time.cpp

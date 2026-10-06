@@ -495,6 +495,84 @@ void test_knobs_must_be_ordered() {
     std::cout << "[PASS] test_knobs_must_be_ordered" << std::endl;
 }
 
+// The only written-down copy of the menus: a taxonomy change has to be reflected here by hand.
+bool legal_per_man_page(SiteId site, FaultKind kind) {
+    switch (site) {
+    case SiteId::malloc:
+    case SiteId::calloc:
+    case SiteId::realloc:
+        return kind == FaultKind::OutOfMemory;
+    case SiteId::open:
+        return kind == FaultKind::OpenEio || kind == FaultKind::NoSpace;
+    case SiteId::read:
+        return kind == FaultKind::ReadEio;
+    case SiteId::write:
+        return kind == FaultKind::WriteEio || kind == FaultKind::ShortWrite ||
+               kind == FaultKind::NoSpace;
+    case SiteId::fsync:
+        return kind == FaultKind::FsyncEio || kind == FaultKind::NoSpace;
+    case SiteId::connect:
+        return kind == FaultKind::ConnRefused || kind == FaultKind::ConnReset;
+    case SiteId::accept:
+        return kind == FaultKind::ConnReset;
+    case SiteId::send:
+        return kind == FaultKind::ConnReset || kind == FaultKind::ShortSend ||
+               kind == FaultKind::PacketDrop || kind == FaultKind::PacketDelay ||
+               kind == FaultKind::PacketReorder || kind == FaultKind::PacketCorrupt;
+    case SiteId::recv:
+        return kind == FaultKind::ConnReset || kind == FaultKind::PeerClose;
+    case SiteId::clock_gettime:
+        return kind == FaultKind::ClockStep;
+    case SiteId::nanosleep:
+        return kind == FaultKind::SleepInterrupted;
+    case SiteId::getrandom:
+        return kind == FaultKind::RandomEagain;
+    case SiteId::crash_node:
+    case SiteId::partition:
+    case SiteId::pause_node:
+        return false;
+    }
+    return false;
+}
+
+// A magnitude-carrying kind may not fire into the past, which is what a negative amount would mean;
+// zero stays legal because it means "no magnitude" and is recorded as a fire all the same.
+void test_a_negative_magnitude_is_rejected() {
+    struct Case {
+        SiteId site;
+        FaultClass cls;
+    };
+    const Case cases[] = {
+        {SiteId::write, FaultClass::Storage},
+        {SiteId::send, FaultClass::Network},
+        {SiteId::clock_gettime, FaultClass::Clock},
+    };
+    for (const Case& c : cases) {
+        FaultConfig cfg = valid_config();
+        cfg.enable_class(c.cls);
+        must(cfg.activate_site(c.site));
+        FaultRule rule;
+        rule.amount = cosmos::Duration{-1};
+        must(cfg.set_rule(c.site, rule));
+        const auto checked = cfg.validate(kNodes);
+        must(!checked.has_value());
+        assert(checked.error().error == ConfigError::BadAmount);
+        assert(checked.error().site == c.site);
+    }
+    std::cout << "[PASS] test_a_negative_magnitude_is_rejected" << std::endl;
+}
+
+void test_legality_table_matches_the_documented_menus() {
+    for (SiteId site : cosmos::kAllSites) {
+        assert(!cosmos::is_legal_outcome(site, FaultKind::None));
+        for (uint8_t raw = 1; raw < static_cast<uint8_t>(FaultKind::_Count); ++raw) {
+            const auto kind = static_cast<FaultKind>(raw);
+            assert(cosmos::is_legal_outcome(site, kind) == legal_per_man_page(site, kind));
+        }
+    }
+    std::cout << "[PASS] test_legality_table_matches_the_documented_menus" << std::endl;
+}
+
 int main() {
     test_valid_config_passes();
     test_bad_rates_are_rejected();
@@ -513,6 +591,8 @@ int main() {
     test_outcome_table_reports_overflow();
     test_widest_site_menu_fits_in_a_table();
     test_knobs_must_be_ordered();
+    test_a_negative_magnitude_is_rejected();
+    test_legality_table_matches_the_documented_menus();
     std::cout << "All fault config tests passed successfully!" << std::endl;
     return 0;
 }

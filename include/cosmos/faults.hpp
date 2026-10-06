@@ -380,6 +380,13 @@ struct FaultRule {
     OutcomeTable outcomes{};
     // Wrapper sites only; 1-based count of eligible calls (§10.1).
     std::optional<uint64_t> fire_on_eligible_call{};
+    // Magnitude for kinds that carry one: PacketDelay's added latency, ClockStep's step forward,
+    // SleepInterrupted's elapsed part. Zero means "no magnitude": the fire is still counted and
+    // recorded. Negative is rejected by validate() for every site, even ones that ignore the
+    // amount (fail fast on a sign error rather than silently accepting a past-directed magnitude).
+    // A clock may only move time forward and a sleep cannot have elapsed a negative amount
+    // (Rule 15).
+    Duration amount{};
 };
 
 enum class ConfigError : uint8_t {
@@ -400,6 +407,7 @@ enum class ConfigError : uint8_t {
     LimitsExceedNodes,
     BadWindowOrder,
     InjectorAlreadyInstalled,
+    BadAmount,
 };
 
 constexpr const char* name_of(ConfigError error) {
@@ -438,6 +446,8 @@ constexpr const char* name_of(ConfigError error) {
         return "BadWindowOrder";
     case ConfigError::InjectorAlreadyInstalled:
         return "InjectorAlreadyInstalled";
+    case ConfigError::BadAmount:
+        return "BadAmount";
     }
     return "?";
 }
@@ -570,6 +580,10 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
         }
         if (!is_finite_rate(rule.rate)) {
             return std::unexpected(ConfigProblem{ConfigError::BadRate, site});
+        }
+        // Zero means "no magnitude" and stays legal; a negative one would fire into the past.
+        if (rule.amount < Duration::zero()) {
+            return std::unexpected(ConfigProblem{ConfigError::BadAmount, site});
         }
 
         const bool can_fire = rule.rate > 0.0 || rule.fire_on_eligible_call.has_value();

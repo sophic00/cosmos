@@ -4,7 +4,9 @@
 #include "cosmos/faults.hpp"
 #include "cosmos/finding.hpp"
 #include "cosmos/memory.hpp"
+#include "cosmos/net.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
 #include "cosmos/trace.hpp"
 #include <expected>
@@ -32,7 +34,8 @@ template <typename Injector> class BasicSimulator {
     // (Rule 1), and the fault engine installed later derives its sub-streams from the Fault
     // domain (install_faults).
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
-        : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)) {
+        : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)),
+          scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_), net_(scheduler_, clock_) {
         // The universe's event stream starts at its seed, and every clock advance from here on
         // is hashed into trace_ (fault fires are hashed by the injector's ledger; see
         // trace_hash()).
@@ -105,6 +108,12 @@ template <typename Injector> class BasicSimulator {
     TrackedHeap& heap() { return heap_; }
     const TrackedHeap& heap() const { return heap_; }
 
+    Scheduler& scheduler() { return scheduler_; }
+    const Scheduler& scheduler() const { return scheduler_; }
+
+    Net& net() { return net_; }
+    const Net& net() const { return net_; }
+
     VirtualClock& clock() { return clock_; }
     const VirtualClock& clock() const { return clock_; }
 
@@ -139,15 +148,10 @@ template <typename Injector> class BasicSimulator {
 
     const std::vector<Failure>& findings() const { return findings_; }
 
-    // Runs the universe until it is quiescent (state-exploration.md §4). Placeholder contract:
-    // with no fiber scheduler yet, the workload function returning IS quiescence, so this is a
-    // no-op — the campaign worker loop calls it unconditionally, which is the point: when the
-    // scheduler lands (design.md §10), this grows into the full three-condition definition —
-    // (1) ReadyQueue empty: no task is runnable; (2) virtual event queue empty: no timer
-    // wakeups or I/O completions pending at any future virtual time; (3) no packets in flight —
-    // and the campaign code does not change.
-    void run_until_quiescence() {}
-
+    // Runs the universe until it is quiescent (state-exploration.md §4): the workload function
+    // returning starts it, and the scheduler's drain finishes it — the campaign worker loop
+    // calls sim.scheduler().run_until_quiescence() unconditionally (design.md §10: ReadyQueue
+    // empty, no future timer wakeups, no packets in flight).
     bool has_injector() const { return injector_.has_value(); }
 
     // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
@@ -169,17 +173,21 @@ template <typename Injector> class BasicSimulator {
     }
 
   private:
-    // thread_local on purpose: a universe belongs to one OS thread. Caveat until the fiber
-    // scheduler lands and pthread_create is genuinely wrapped: threads spawned through the
-    // current passthrough get their own empty slot on their own OS thread, so wrapped calls
-    // made there fall through to the real host clock/heap instead of this universe. Keep
-    // simulation workloads single-threaded until then, or real and virtual state will mix.
+    // thread_local on purpose: a universe belongs to one OS thread. Fibers of
+    // one universe share this slot; wrapped calls on any fiber reach the same
+    // universe. A second OS thread gets its own empty slot and falls through
+    // to the host until fibers span threads (out of scope for v1).
     inline static thread_local BasicSimulator* current_sim_{nullptr};
     uint64_t seed_;
     TrackedHeap heap_{};
     Rng user_rng_;
     TraceHash trace_;
     VirtualClock clock_{};
+    // After clock_: borrows it for timer wakeups. Before injector_: both borrow
+    // the clock and destruction is reverse order.
+    Scheduler scheduler_;
+    // After scheduler_ and clock_, both of which it borrows.
+    Net net_;
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::vector<Failure> findings_;
     std::optional<Injector> injector_{};
