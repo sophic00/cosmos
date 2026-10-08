@@ -1022,9 +1022,11 @@ heap's `active_allocations` — §11.4's
 vacuous-coverage guard reads counters, so a campaign must not have to reach back into a finished
 universe's injector for them.
 
-> **Stale spelling in §17.** §17.2 and §17.3 write `Scenario scenario{.faults = plan}`. That form
-> cannot coexist with a user-declared constructor or factory, and predates `create()`. Read those
-> two lines as `auto scenario = Scenario::create(seed, plan);`.
+> **Stale spelling in §17.** §17.2 writes `Scenario scenario{.faults = plan}`. That form cannot
+> coexist with a user-declared constructor or factory, and predates `create()`. Read that line as
+> `auto scenario = Scenario::create(seed, plan);`. §17.3's campaign sketch carried the same form and
+> a `void`-returning `build_fn`; both are corrected in place there, and `design.md` §13 now declares
+> the shipped surface.
 
 `cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and returns a `ScenarioReport`. On failure the report carries `ledger_dump`, the §11.1 ledger rendered **before** the universe is destroyed — otherwise no caller could ever print it, since the sugar owns the injector and destroys it on return. `print_report` appends the dump when it is present. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`. `RunSpec::check_id` names the oracle's check so a failing report is self-describing. The universe is destroyed when `run` returns, so any block the workload hands back outlives its heap and is released through the orphan path — nothing can count those blocks afterwards, which is why a universe-end leak check can never fire for the sugar. `fail_on_call` is an **eligible-call** index at `SiteId::malloc` (§10) and counts every allocation that reaches the wrapped symbol, the harness's own included. It does **not** count what never reaches it, and which allocations do is **linkage-dependent**. Under the default shared-`libstdc++` link, `operator new` — and therefore every `std::` container — is not interposed, because it lives in `libstdc++.so` whose internal `malloc` binding `--wrap` does not rewrite. Under `-static-libstdc++` it is; `tests/CMakeLists.txt` links the scenario suite a second time that way as `test_scenario_static` so both sides are pinned rather than assumed (that target is probed for and skipped on toolchains without a static `libstdc++`, which includes this repository's clang). Do not rely on either behaviour: a test needing an exact eligible count must use the raw allocator, which is why the worked example's fixture allocates into a stack array. The oracle is a bool-returning callable; the teaser's `CHECK(...)` spelling arrives with `assert.hpp` in F4.
 
@@ -1240,7 +1242,7 @@ scenario.note_covered("node-crash-path-exercised", a_process_fault_fired_this_ru
 
 ### 17.3 Step 3 — Run the campaign
 
-The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated:
+The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated. The two call forms the sketch got wrong are corrected here: a scenario is built by a factory, never by brace-initialising a `faults` member, and `build_fn` returns the universe's report, because a `void` return would leave the findings unreachable.
 
 ```cpp
 CampaignConfig ccfg;
@@ -1248,12 +1250,12 @@ ccfg.trials    = 5000;
 ccfg.base_seed = 1;
 
 CampaignReport report = Campaign::run(ccfg, [&](Simulator& sim, uint64_t universe_index) {
-    Scenario scenario{.faults = FaultConfig::sample(sim.swarm_rng())};
-    run_replicated_kv_scenario(scenario);   // the exact harness from §17.2, one seed at a time
+    auto scenario = Scenario::on(sim, FaultConfig::sample(sim.swarm_rng()));
+    return run_replicated_kv_scenario(*scenario);   // the exact harness from §17.2, one seed at a time
 });
 ```
 
-Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. The user does not watch any of this run — they read `report` afterward:
+Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. `build_fn` runs in a worker process, not in the caller's: that is what turns a crashing universe into a finding instead of a dead campaign, and it means the returned report is the only channel back. The user does not watch any of this run — they read `report` afterward:
 
 ```text
 report.runs        = 5000

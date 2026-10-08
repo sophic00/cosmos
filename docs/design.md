@@ -300,25 +300,64 @@ namespace cosmos {
 
 ## 13. Campaign Engine (`campaign.hpp`)
 
+The declarations below are the shipped surface. Three of them differ from the sketch this section
+originally carried, each for a reason recorded here rather than left as drift:
+
+- **`build_fn` returns a `ScenarioReport`.** It was `void`. A `void` return makes the findings
+  unreachable: the report lives in the Scenario the callee owns, and the campaign has no other
+  channel. §17.3's call shape is unchanged.
+- **`Failure` is `Finding`.** `Failure` was declared here and defined nowhere; the glossary (§1) and
+  §15 both call it a Finding.
+- **A universe runs in a worker process, not in the caller's.** That is what makes a crash a finding
+  instead of a dead campaign. The consequence is deliberate and load-bearing: writes to captured
+  variables inside `build_fn` are **not** visible after `run` returns, and its returned
+  `ScenarioReport` is the only channel back. Use `Scenario::on(sim, plan)` (not
+  `Scenario::create`) so the campaign's own Simulator is the one that runs.
+
 ```cpp
 struct CampaignConfig {
     uint64_t trials    = 1000;
     uint64_t base_seed = 0;
     unsigned parallel  = std::thread::hardware_concurrency();
-    bool     verify    = false;   // double-run verification mode
+    uint32_t node_count = 1;
+    bool     verify    = false;   // needs the P5 decision trace; refused, never ignored
+    std::string program;          // named in the repro line, e.g. "myapp_test"
+};
+
+struct Finding {
+    std::string id;               // the assertion id -- the dedup key, never the fault set
+    uint64_t    index, seed;      // (base_seed, index) and the universe seed it derives
+    std::string detail, ledger;   // from the first universe that failed this id
+    Time        at{};
+    uint64_t    universes_failed;
+    bool        rare;             // reproduces in under a third of the runs
 };
 
 struct CampaignReport {
-    uint64_t runs, failed_runs;
-    std::vector<Failure> findings;
-    std::vector<std::string> never_hit;
+    uint64_t runs, failed_runs, crashed_runs;
+    bool     refused;             // the harness declined to run; findings hold the reason
+    std::vector<Finding>     findings;   // sorted by id, so parallel == sequential exactly
+    std::vector<std::string> never_hit;  // its own section, never a flag on a finding
+    SiteCounterMap eligible_calls, injections;
+    uint64_t out_of_scope_assertions;
+    uint64_t base_seed;
+    std::string program;
 };
 
 class Campaign {
 public:
-    static CampaignReport run(CampaignConfig, std::function<void(Simulator&, uint64_t)> build_fn);
+    static CampaignReport run(const CampaignConfig&, const UniverseFn& build_fn);
 };
 ```
+
+`print_campaign_report` renders §17.4's shape plus the repro line; `print_campaign_json` emits the
+machine-readable form the P4 exit gate asks for — findings, `never_hit` kept apart, per-site
+counters and repro seeds — so a dashboard consumes the report rather than being a feature to build.
+
+**`verify` is refused, not ignored.** It names a double-run FNV-1a trace-hash check that needs the
+decision trace (§11.2), which lands with P5. Until then `run` returns immediately with a
+`cosmos.campaign.verify` finding and `runs == 0`, because a caller must not read a green campaign as
+a determinism guarantee.
 
 ---
 

@@ -290,6 +290,29 @@ endif()
 
 add_test(NAME test_scenario COMMAND test_scenario)
 
+add_executable(test_assert test_assert.cpp)
+target_link_libraries(test_assert PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Same link shape as test_scenario: assertions allocate through the harness's own bookkeeping.
+    target_compile_options(test_assert PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_assert COMMAND test_assert)
+
 add_executable(test_scheduler test_scheduler.cpp)
 target_link_libraries(test_scheduler PRIVATE cosmos)
 # White-box test: pins the engine-context passthrough contract from wrapper_fault.hpp.
@@ -370,6 +393,31 @@ else()
     message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
 endif()
 
+# Second link of the assertion suite, for the same reason: operator new reaches the wrappers only
+# here, so test_passing_check_does_not_allocate can only actually measure anything in this link.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_assert_static test_assert.cpp)
+    target_link_libraries(test_assert_static PRIVATE cosmos)
+    target_compile_options(test_assert_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+    add_test(NAME test_assert_static COMMAND test_assert_static)
+else()
+    message(STATUS "test_assert_static skipped: no static libstdc++ for this toolchain")
+endif()
+
 # The P2-S3 end-to-end fixture: a plain C application that knows nothing about libcosmos, driven by
 # the Scenario harness. Compiled twice from one source -- the fix is the -D, so the two targets
 # differ only by the nullptr check -- and both run under ctest.
@@ -431,3 +479,31 @@ if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     )
     add_test(NAME test_broken_app_static COMMAND test_broken_app_static)
 endif()
+
+# The campaign runner drives the same deliberately-broken application across many seeds, so it needs
+# the same fixture source and the same wrapped allocator channel.
+add_executable(test_campaign
+    test_campaign.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+)
+target_link_libraries(test_campaign PRIVATE cosmos)
+target_include_directories(test_campaign PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_campaign PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_campaign PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_campaign COMMAND test_campaign)

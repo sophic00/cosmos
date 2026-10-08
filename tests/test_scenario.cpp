@@ -501,6 +501,45 @@ void test_same_seed_twice_reports_identically() {
     std::cout << "[PASS] test_same_seed_twice_reports_identically" << std::endl;
 }
 
+// Scenario::on drives a universe the caller owns, which is what lets the campaign runner build one
+// Simulator per universe without handing its ownership to the harness.
+void test_scenario_on_borrows_an_externally_owned_simulator() {
+    cosmos::Simulator sim(kSeed);
+
+    {
+        auto scenario = cosmos::Scenario::on(sim, cosmos::FaultPlan{});
+        must(scenario.has_value());
+        must(scenario->report().seed == kSeed);
+
+        scenario->run([] {});
+        scenario->quiesce();
+        must(scenario->check("oracle", [] { return true; }));
+        must(scenario->report().passed());
+    }
+
+    // The scenario is gone; the universe it borrowed is not, and is still the caller's to drive.
+    cosmos::Simulator::set_current(&sim);
+    void* block = malloc(16);
+    must(block != nullptr);
+    free(block);
+    cosmos::Simulator::set_current(nullptr);
+    must(sim.heap().active_count() == 0);
+
+    std::cout << "[PASS] test_scenario_on_borrows_an_externally_owned_simulator" << std::endl;
+}
+
+// A second install on one universe would fork its streams and counters, so the borrow is refused.
+void test_scenario_on_refuses_a_second_install() {
+    cosmos::Simulator sim(kSeed);
+    must(cosmos::Scenario::on(sim, cosmos::FaultPlan{}).has_value());
+
+    auto second = cosmos::Scenario::on(sim, cosmos::FaultPlan{});
+    must(!second.has_value());
+    must(second.error().error == cosmos::ConfigError::InjectorAlreadyInstalled);
+
+    std::cout << "[PASS] test_scenario_on_refuses_a_second_install" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -524,6 +563,8 @@ int main() {
     test_run_restores_the_previous_universe();
     test_invalid_plan_is_rejected_at_create();
     test_same_seed_twice_reports_identically();
+    test_scenario_on_borrows_an_externally_owned_simulator();
+    test_scenario_on_refuses_a_second_install();
     std::cout << "All scenario tests passed successfully!" << std::endl;
     return 0;
 }
