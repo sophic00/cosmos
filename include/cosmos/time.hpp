@@ -7,6 +7,8 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "cosmos/trace.hpp"
+
 // glibc exposes TIMER_ABSTIME only under feature-test macros; define the POSIX value so the
 // header stays self-contained under strict -std builds.
 #ifndef TIMER_ABSTIME
@@ -142,6 +144,11 @@ class VirtualClock {
                           int64_t realtime_epoch_ns = kDefaultRealtimeEpochNs)
         : now_(start_time), realtime_epoch_ns_(realtime_epoch_ns) {}
 
+    // Optional observer fed every clock-advance event (see trace.hpp). Reads never touch it:
+    // a clock read is a pure function of the event stream, not an event itself. The Simulator
+    // attaches its TraceHash here; a bare clock (injector tests) stays observer-free.
+    void attach_trace(TraceHash* trace) { trace_ = trace; }
+
     constexpr Time now() const { return now_; }
     constexpr int64_t now_ns() const { return now_.ns; }
 
@@ -154,11 +161,19 @@ class VirtualClock {
     void advance(Duration d) {
         if (d.ns <= 0) return;
         now_ = now_ + d;
+        if (trace_ != nullptr) {
+            trace_->absorb_tag(static_cast<uint8_t>(TraceEvent::ClockAdvance));
+            trace_->absorb_i64(d.ns);
+        }
     }
 
     void advance_to(Time target) {
         if (target > now_) {
             now_ = target;
+            if (trace_ != nullptr) {
+                trace_->absorb_tag(static_cast<uint8_t>(TraceEvent::ClockAdvanceTo));
+                trace_->absorb_i64(target.ns);
+            }
         }
     }
 
@@ -316,6 +331,7 @@ class VirtualClock {
 
     Time now_{Time::zero()};
     int64_t realtime_epoch_ns_{kDefaultRealtimeEpochNs};
+    TraceHash* trace_{nullptr};
 };
 
 } // namespace cosmos

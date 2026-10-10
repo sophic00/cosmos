@@ -2,6 +2,7 @@
 
 #include "cosmos/faults.hpp"
 #include "cosmos/time.hpp"
+#include "cosmos/trace.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,17 @@ constexpr size_t kLedgerCapacity = 256;
 class FaultLedger {
   public:
     void record(const LedgerEntry& entry) {
+        // Absorb into the live trace digest before the capacity check: a dropped entry is an
+        // event that happened, so the trace hash must reflect it even though it is not stored.
+        trace_.absorb_tag(static_cast<uint8_t>(TraceEvent::FaultFire));
+        trace_.absorb_u64(entry.fire_index);
+        trace_.absorb_i64(entry.at.ns);
+        trace_.absorb_u64(static_cast<uint64_t>(entry.site));
+        trace_.absorb_u64(entry.eligible_index);
+        trace_.absorb_tag(static_cast<uint8_t>(entry.fault_class));
+        trace_.absorb_tag(static_cast<uint8_t>(entry.outcome));
+        trace_.absorb_bool(entry.drew);
+
         if (size_ == kLedgerCapacity) {
             ++dropped_;
             return;
@@ -46,10 +58,15 @@ class FaultLedger {
     const LedgerEntry* begin() const { return entries_.data(); }
     const LedgerEntry* end() const { return entries_.data() + size_; }
 
+    // The fault-fire portion of the universe's trace hash: every record() call, in order,
+    // including the ones past capacity.
+    uint64_t trace_hash() const { return trace_.digest(); }
+
   private:
     std::array<LedgerEntry, kLedgerCapacity> entries_{};
     size_t size_ = 0;
     uint64_t dropped_ = 0;
+    TraceHash trace_{};
 };
 
 } // namespace cosmos
