@@ -337,6 +337,23 @@ constexpr const char* name_of(FaultKind kind) {
     return "?";
 }
 
+// §11.1's status column, shared by the ledger and the decision trace. Only the trace can hold
+// Suppressed today; Skipped needs episodes (F6).
+enum class DecisionStatus : uint8_t { Fired = 0, Suppressed = 1, Skipped = 2 };
+
+// The rendered column is upper case, so the token is too (§11.1).
+constexpr const char* name_of(DecisionStatus status) {
+    switch (status) {
+    case DecisionStatus::Fired:
+        return "FIRED";
+    case DecisionStatus::Suppressed:
+        return "SUPPRESSED";
+    case DecisionStatus::Skipped:
+        return "SKIPPED";
+    }
+    return "?";
+}
+
 struct SiteOutcome {
     FaultKind kind = FaultKind::None;
     double weight = 0.0;
@@ -426,6 +443,8 @@ enum class ConfigError : uint8_t {
     BadWindowOrder,
     InjectorAlreadyInstalled,
     BadAmount,
+    BadTraceCapacity,
+    TruncatedTrace,
 };
 
 constexpr const char* name_of(ConfigError error) {
@@ -466,6 +485,10 @@ constexpr const char* name_of(ConfigError error) {
         return "InjectorAlreadyInstalled";
     case ConfigError::BadAmount:
         return "BadAmount";
+    case ConfigError::BadTraceCapacity:
+        return "BadTraceCapacity";
+    case ConfigError::TruncatedTrace:
+        return "TruncatedTrace";
     }
     return "?";
 }

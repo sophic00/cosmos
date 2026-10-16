@@ -11,6 +11,9 @@ namespace cosmos {
 
 namespace detail {
 
+// Sized to the longest status token (§11.1: SUPPRESSED), so no status can run into the drew column.
+inline constexpr int kStatusWidth = 12;
+
 // Grouped by hand rather than through the stream's locale: the checkpoint is byte-identical output
 // for the same seed, and a locale is ambient state the run does not control.
 inline std::string grouped(uint64_t value) {
@@ -66,7 +69,8 @@ template <typename Injector> void print_ledger(std::ostream& out, const Injector
     for (const LedgerEntry& entry : ledger) {
         body << "  " << std::setw(static_cast<int>(time_width)) << detail::format_time(entry.at)
              << std::setw(8) << name_of(entry.fault_class) << " " << std::setw(20)
-             << ("site=" + std::string(name_of(entry.site))) << " FIRED    drew=" << std::setw(4)
+             << ("site=" + std::string(name_of(entry.site))) << " "
+             << std::setw(detail::kStatusWidth) << name_of(entry.status) << "drew=" << std::setw(4)
              << (entry.drew ? "yes" : "no") << " eligible #" << entry.eligible_index << " -> "
              << name_of(entry.outcome) << "\n";
     }

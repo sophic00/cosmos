@@ -85,6 +85,8 @@ void test_fired_entry_records_every_field() {
     assert(first.outcome == FaultKind::WriteEio);
     assert(first.eligible_index == 1);
     assert(first.drew);
+    // Nothing can produce the other two yet, so a recorded entry is always a fire (§11.1).
+    assert(first.status == cosmos::DecisionStatus::Fired);
 
     assert(injector.ledger()[1].fire_index == 1);
     assert(injector.ledger()[1].eligible_index == 2);
@@ -204,8 +206,8 @@ void test_printed_ledger_matches_the_doc_format() {
 
     const std::string expected =
         "Fault ledger:\n"
-        "  t=0ms    Storage  site=write           FIRED    drew=yes  eligible #1 -> WriteEio\n"
-        "  t=0ms    Storage  site=open            FIRED    drew=no   eligible #2 -> OpenEio\n"
+        "  t=0ms    Storage  site=write           FIRED       drew=yes  eligible #1 -> WriteEio\n"
+        "  t=0ms    Storage  site=open            FIRED       drew=no   eligible #2 -> OpenEio\n"
         "\n"
         "Per-site counters:  open eligible=2 fired=1 · write eligible=1 fired=1\n";
     assert(printed(injector) == expected);
@@ -226,15 +228,16 @@ void test_printed_times_keep_resolution_and_alignment() {
     clock.advance(29_s);
     injector.decide(FaultClass::Storage, SiteId::write);
 
-    const std::string expected = "Fault ledger:\n"
-                                 "  t=0ms          Storage  site=write           FIRED    drew=yes "
-                                 " eligible #1 -> WriteEio\n"
-                                 "  t=1.500ms      Storage  site=write           FIRED    drew=yes "
-                                 " eligible #2 -> WriteEio\n"
-                                 "  t=29001.500ms  Storage  site=write           FIRED    drew=yes "
-                                 " eligible #3 -> WriteEio\n"
-                                 "\n"
-                                 "Per-site counters:  write eligible=3 fired=3\n";
+    const std::string expected =
+        "Fault ledger:\n"
+        "  t=0ms          Storage  site=write           FIRED       drew=yes "
+        " eligible #1 -> WriteEio\n"
+        "  t=1.500ms      Storage  site=write           FIRED       drew=yes "
+        " eligible #2 -> WriteEio\n"
+        "  t=29001.500ms  Storage  site=write           FIRED       drew=yes "
+        " eligible #3 -> WriteEio\n"
+        "\n"
+        "Per-site counters:  write eligible=3 fired=3\n";
     assert(printed(injector) == expected);
 
     std::cout << "[PASS] test_printed_times_keep_resolution_and_alignment" << std::endl;
@@ -263,6 +266,19 @@ void test_empty_ledger_prints_a_placeholder() {
     assert(printed(injector) == expected);
 
     std::cout << "[PASS] test_empty_ledger_prints_a_placeholder" << std::endl;
+}
+
+// The column is sized to the longest status token, so a narrower one runs SUPPRESSED into drew=.
+void test_status_column_fits_every_status_token() {
+    for (const cosmos::DecisionStatus status :
+         {cosmos::DecisionStatus::Fired, cosmos::DecisionStatus::Suppressed,
+          cosmos::DecisionStatus::Skipped}) {
+        const std::string token = cosmos::name_of(status);
+        assert(!token.empty());
+        assert(static_cast<int>(token.size()) + 1 <= cosmos::detail::kStatusWidth);
+    }
+
+    std::cout << "[PASS] test_status_column_fits_every_status_token" << std::endl;
 }
 
 void test_same_seed_prints_identical_ledgers() {
@@ -303,6 +319,7 @@ int main() {
     test_partial_rate_run_records_one_entry_per_fire();
     test_ledger_overflow_is_counted_and_counters_stay_exact();
     test_printed_ledger_matches_the_doc_format();
+    test_status_column_fits_every_status_token();
     test_printed_times_keep_resolution_and_alignment();
     test_negative_timestamp_formats_without_throwing();
     test_empty_ledger_prints_a_placeholder();

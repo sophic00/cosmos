@@ -612,6 +612,8 @@ Each entry carries an explicit status:
 
 Each entry also records **whether a random draw was consumed** (`drew: yes/no`) — `yes` for probabilistic fires, `no` for deterministic-trigger fires, heals, and refusals. The flag becomes load-bearing in the decision trace (§11.2), where a replay cannot tell a "returned early, stream untouched" decision from a "drew and lost the coin flip" decision without it — and those leave the RNG in different states.
 
+(The rendered status column is sized to the longest token — `SUPPRESSED` — so the samples below, drawn when only `FIRED` existed, are one field narrower than the printer's output.)
+
 ```text
 Run 8421 (FAILED: "no split-brain") — fault ledger:
   t=12ms   Memory   site=malloc      FIRED    drew=yes  alloc #443 → ENOMEM
@@ -639,19 +641,21 @@ The obvious identity is `(class, site_id, occurrence_index)`, where `occurrence_
 
 The identity must therefore come from the **recorded decision schedule**, not from live execution. The trace is **one globally ordered list**, not per-site queues:
 
-- The original run writes a **decision trace**: an ordered list of `(seq, virtual_time, site_id, eligible_index, outcome, drew)` entries, in the order the decisions happened. `seq` is a strictly increasing sequence number; `eligible_index` is the eligible-call count at record time — informational only, never recomputed during replay.
+- The original run writes a **decision trace**: an ordered list of `(seq, virtual_time, site_id, eligible_index, outcome, amount, drew, status)` entries, in the order the decisions happened. `seq` is a strictly increasing sequence number; `eligible_index` is the eligible-call count at record time — informational only, never recomputed during replay. `amount` is the rule's magnitude, which a replayed `PacketDelay`/`ClockStep`/`SleepInterrupted` needs to reproduce; `status` is §11.1's status, which Rule 9 requires on every recorded decision.
 - A replay walks the trace with a **single cursor**. At each live decision point it peeks at the cursor entry:
   - **Same site** → consume the entry and honour it: apply its outcome (or withhold it, if the entry was rewritten to `Suppressed`), and if `drew = yes`, consume exactly one draw from that class's sub-stream *even when the outcome is suppressed* — the stream must advance exactly as the original run's did, or every later honoured entry receives a different random value.
   - **Different site, or trace exhausted** → control flow has diverged from the original run (or run past its end). The call **passes through with no draw and no fault** (Rule 12). Replay never invents faults that were not in the original trace — otherwise a minimization re-run could "still fail" because of a fault that never existed in the failing run, and the reduction would prove nothing.
-- Suppression rewrites one entry's outcome to `Suppressed` and leaves every other entry untouched.
+- Suppression rewrites one entry's **status** to `Suppressed` and leaves every other field — and every other entry — untouched. The outcome is kept rather than blanked, so a reader can still see what was withheld; a withheld entry is one whose status is not `Fired`.
 
 **Why global order, and not a per-site queue:** sites within one fault class *share* the class sub-stream (Rule 2). The original run's draws from e.g. the `Memory` stream are interleaved across `malloc`/`calloc`/`realloc` in one specific order, and that order is part of the stream's state. Consuming entries per-site could hand a draw intended for a `calloc` decision to a `malloc` decision. The single cursor preserves the original per-class draw order exactly, for as long as the replayed execution tracks the original one.
 
 **What replay guarantees, stated honestly:**
 
-1. **Replay is deterministic.** `replay(trace, seed)` is a pure function: cursor position, stream positions, and application behaviour are all fully determined by the trace and the seed. Two replays of the same trace produce bit-identical traces.
+1. **Replay is deterministic.** `replay(trace, filter, plan)` is a pure function: cursor position, stream positions, and application behaviour are all fully determined by the trace, the filter and the config. The seed travels *in* the trace, so a replay cannot be seeded against a different run. Two replays of the same trace produce bit-identical traces.
 2. **Pre-divergence, replay is identical to the original run** — same decisions, same draws, same outcomes.
-3. **Post-divergence, alignment is best-effort.** Once suppression changes control flow, later trace entries may no longer line up with live calls. The no-novel-faults rule keeps the replay honest; it does not pretend to reconstruct the original run's RNG alignment, because no scheme can.
+3. **Post-divergence, alignment is best-effort.** Once suppression changes control flow, later trace entries may no longer line up with live calls. The no-novel-faults rule keeps the replay honest; it does not pretend to reconstruct the original run's RNG alignment, because no scheme can. The cursor is a **peek, not a skip**: a mismatch passes the call through and leaves the cursor where it is, so an execution that later re-converges to the original's shape picks the schedule up again, and one that never re-converges passes through for the rest of the run.
+
+A replay run **records its own trace**, so the exit gate's "suppressing one fault leaves every other honoured entry bit-identical" is an entry-by-entry comparison rather than an inference from counters. Its ledger records the withheld faults too, with `status = Suppressed` (§11.1): what the application was spared is as much a part of the report as what it endured.
 
 This makes identity a property of the *recorded schedule*, which suppression edits deliberately, rather than of the *replayed execution*, which suppression perturbs as a side effect. Episode triggers (§10.2) are recorded in the trace as zero-draw entries at their virtual timestamps; since scheduled episodes are armed at universe start, they re-fire at the same virtual times in replay, as long as the replayed run's clock reaches them — one of the few things divergence cannot easily move.
 
@@ -1095,11 +1099,12 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 
 | §12 reference | What the code has today | Closed by |
 |---|---|---|
-| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock)` | F6: event queue + node registry |
+| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock, trace_options)` | F6: event queue + node registry |
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
-| Ledger | Records fires only, in fixed non-allocating storage (Rule 7), with the §11.1 printer. No `Status` field yet: `Fired` is the only status P1 can produce, so the printer emits it as a literal in that column | F6 adds `Status` with episodes and heals; F5 adds the decision trace (§11.2) |
+| Ledger | Records fires in fixed non-allocating storage (Rule 7), with the §11.1 printer. `LedgerEntry` carries `DecisionStatus`: a replay run's withheld fires are rows with `Suppressed`. Nothing yet produces `Skipped` | F6: episodes and heals produce `Skipped` |
+| Decision trace (§11.2) | Recorded per post-gate decision in `include/cosmos/trace.hpp`, off unless `TraceOptions::enabled`; `Scenario::replay` reads it back with a `TraceFilter`, and `Injector::draws()` counts the stream's advance | F5: minimization, canonical encoding |
 | Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
 
 **Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.

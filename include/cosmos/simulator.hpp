@@ -66,8 +66,8 @@ template <typename Injector> class BasicSimulator {
 
     uint64_t seed() const { return seed_; }
 
-    [[nodiscard]] std::expected<void, ConfigProblem> install_faults(FaultConfig cfg,
-                                                                    uint32_t node_count = 1) {
+    [[nodiscard]] std::expected<void, ConfigProblem>
+    install_faults(FaultConfig cfg, uint32_t node_count = 1, TraceOptions trace_options = {}) {
         // A second install would fork stream positions, counters and the ledger against one run.
         if (injector_.has_value()) {
             return std::unexpected(
@@ -76,9 +76,11 @@ template <typename Injector> class BasicSimulator {
         // Seeding from the universe seed instead of the Fault domain would collide five of six
         // class sub-streams with the domain streams.
         auto made = Injector::create(std::move(cfg), stream_seed(seed_, StreamDomain::Fault),
-                                     node_count, clock_);
+                                     node_count, clock_, trace_options);
         if (!made.has_value()) return std::unexpected(made.error());
         injector_.emplace(std::move(*made));
+        // The trace names its own universe, so Scenario::replay needs no seed argument.
+        injector_->set_universe_seed(seed_);
         return {};
     }
 

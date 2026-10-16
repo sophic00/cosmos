@@ -525,3 +525,74 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_campaign COMMAND test_campaign)
+
+# The decision trace is recorded inside decide(), so its tests need the same allocator channel the
+# wrappers use for the heap-invisibility case.
+add_executable(test_trace test_trace.cpp)
+target_link_libraries(test_trace PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_trace PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_trace PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_trace COMMAND test_trace)
+
+# The replay engine drives the same wrapped allocator channel the trace does, and needs calloc for
+# the two-site fixture that makes divergence observable.
+add_executable(test_replay test_replay.cpp)
+target_link_libraries(test_replay PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_replay PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_replay PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_replay COMMAND test_replay)
+
+# Second link of the trace suite. std:: allocations only reach the wrappers under a static
+# libstdc++, so the preallocation claim in test_recording_never_allocates_with_a_universe_current
+# is only measurable here.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_trace_static test_trace.cpp)
+    target_link_libraries(test_trace_static PRIVATE cosmos)
+    target_compile_options(test_trace_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_trace_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+    add_test(NAME test_trace_static COMMAND test_trace_static)
+else()
+    message(STATUS "test_trace_static skipped: no static libstdc++ for this toolchain")
+endif()

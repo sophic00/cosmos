@@ -78,9 +78,11 @@ inline bool failed(const ScenarioReport& report) { return !report.no_check_faile
 class Scenario {
   public:
     [[nodiscard]] static std::expected<Scenario, ConfigProblem>
-    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1) {
+    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1,
+           TraceOptions trace_options = {}) {
         auto sim = std::make_unique<Simulator>(seed);
-        if (auto installed = sim->install_faults(std::move(plan), node_count); !installed) {
+        if (auto installed = sim->install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
             return std::unexpected(installed.error());
         }
         return Scenario(seed, std::move(sim));
@@ -88,12 +90,32 @@ class Scenario {
 
     // A scenario over a universe the caller owns and outlives: the campaign runner builds one
     // Simulator per universe and must not hand its ownership to the harness.
-    [[nodiscard]] static std::expected<Scenario, ConfigProblem> on(Simulator& sim, FaultPlan plan,
-                                                                   uint32_t node_count = 1) {
-        if (auto installed = sim.install_faults(std::move(plan), node_count); !installed) {
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem>
+    on(Simulator& sim, FaultPlan plan, uint32_t node_count = 1, TraceOptions trace_options = {}) {
+        if (auto installed = sim.install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
             return std::unexpected(installed.error());
         }
         return Scenario(sim);
+    }
+
+    // §11.2's replay: the same universe and the same config, driven by a recorded decision
+    // schedule. The seed travels with the trace, so a replay cannot be seeded against another run.
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem>
+    replay(const FaultTrace& trace, TraceFilter filter, FaultPlan plan, uint32_t node_count = 1) {
+        // A trace that lost entries would replay its first N and pass the rest through, which
+        // Rule 12 makes indistinguishable from a run that simply had no more faults.
+        if (trace.dropped() > 0) {
+            return std::unexpected(ConfigProblem{ConfigError::TruncatedTrace, std::nullopt});
+        }
+
+        auto scenario = create(trace.universe_seed(), std::move(plan), node_count,
+                               TraceOptions{.enabled = true, .capacity = trace.capacity()});
+        if (!scenario) return std::unexpected(scenario.error());
+
+        // create() installed the injector; a scenario without one is not reachable from here.
+        scenario->simulator().injector_or_null()->replay_from(trace, std::move(filter));
+        return scenario;
     }
 
     template <Workload F> void run(F&& workload) {

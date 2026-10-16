@@ -8,13 +8,13 @@
 
 namespace cosmos {
 
-// §11.1 records fires, heals and limit-refused episode starts. P1 has no episodes and does not
-// record gate rejections, so every P1 entry is a fire.
+// §11.1 records fires, heals and limit-refused episode starts. Gate rejections are counted, never
+// recorded, and nothing produces Suppressed or Skipped yet, so every entry today is a fire.
 // fire_index counts fires only, and is deliberately not the decision trace's `seq` (§11.2), which
 // numbers every post-gate decision including the ones that drew and lost. Building F5's trace on
 // this counter would misalign the replayed stream, and both sequences look right while it happens.
 //
-// Wide fields first: the three small ones together cost 16 bytes less per entry than interleaved.
+// Wide fields first: the one-byte fields pack into the tail padding of the wide ones.
 struct LedgerEntry {
     uint64_t fire_index;
     Time at;
@@ -23,6 +23,7 @@ struct LedgerEntry {
     FaultClass fault_class;
     FaultKind outcome;
     bool drew;
+    DecisionStatus status = DecisionStatus::Fired;
 };
 
 constexpr size_t kLedgerCapacity = 256;
